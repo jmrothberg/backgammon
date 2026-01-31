@@ -17,10 +17,16 @@ A sophisticated backgammon game implementation featuring both traditional search
 
 ### Prerequisites
 
+**For Playing the Game:**
 - Python 3.8+
 - PyGame
 - PyTorch (for LLM inference)
 - NumPy
+
+**For Training AI Models:**
+- GNU Backgammon (http://www.gnu.org/software/gnubg/) - for generating expert-level training games
+- Large dataset of SGF format backgammon games
+- Significant computational resources (GPU recommended for training)
 
 ### Installation
 
@@ -77,6 +83,43 @@ The project includes tools for generating and processing backgammon game data:
   - Trains from expert GNU Backgammon games
   - Uses per-game training strategy for better learning
   - Produces models that can be used with the inference engine
+
+## 🏗️ Training Prerequisites & Data Generation
+
+### GNU Backgammon Setup
+To train the AI model, you need expert-level backgammon games. The best source is GNU Backgammon:
+
+1. **Download GNU Backgammon**:
+   - Visit: http://www.gnu.org/software/gnubg/
+   - Download the appropriate version for your operating system
+   - Install the program
+
+2. **Generate Training Games**:
+   ```bash
+   # Run GNU Backgammon and use its analysis features to generate games
+   # Save games in SGF format (Smart Game Format)
+   ```
+
+### Alternative: Use Included Game Generator
+If GNU Backgammon is unavailable, use the included Python game generator:
+
+```bash
+python generate_backgammon_games.py
+```
+
+**Note**: GNU Backgammon games provide much higher quality training data than synthetic generation.
+
+### Data Processing Pipeline
+1. **Generate/Aquire SGF Games**: Expert-level backgammon games in SGF format
+2. **Convert to Atomic Format**: Use `convert_old_to_atomic_format.py` to process the data
+3. **Train Model**: Run `BackgammonBrain_Atom_Pergame_11_20_25.py` on the processed data
+4. **Deploy**: Use trained model with `BackgammonMovePredictor_Standalone_Atom.py`
+
+### Training Data Requirements
+- **Quality**: Expert-level games preferred (GNU Backgammon analysis)
+- **Quantity**: Thousands of games for meaningful training
+- **Format**: SGF files (standard backgammon game format)
+- **Processing**: Convert to atomic tokenization format before training
 
 ## 🛠️ Project Structure
 
