@@ -72,12 +72,19 @@ The project includes tools for generating and processing backgammon game data:
 - `convert_old_to_atomic_format.py`: Processes game data for training
 - SGF format game databases (excluded from repo due to size)
 
+### Training the AI Model
+- `BackgammonBrain_Atom_Pergame_11_20_25.py`: Complete transformer training implementation
+  - Trains from expert GNU Backgammon games
+  - Uses per-game training strategy for better learning
+  - Produces models that can be used with the inference engine
+
 ## 🛠️ Project Structure
 
 ```
 backgammon/
 ├── backgammon_Atom_Dec_11_25.py          # Main game file
-├── BackgammonMovePredictor_Standalone_Atom.py  # LLM inference
+├── BackgammonBrain_Atom_Pergame_11_20_25.py    # Transformer training script
+├── BackgammonMovePredictor_Standalone_Atom.py  # LLM inference engine
 ├── generate_backgammon_games.py          # Game data generation
 ├── convert_old_to_atomic_format.py       # Data processing
 ├── README_BACKGAMMON_PER_GAME.md         # Training strategy docs
