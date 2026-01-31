@@ -1,6 +1,6 @@
 # BackgammonBrain "Per-Game" Training Strategy Explained
 
-This document explains the "Per-Game" training strategy used in `BackgammonBrain_Atom_Pergame_11_19_25.py` and why it represents a fundamental shift in how the AI learns backgammon.
+This document explains the "Per-Game" training strategy used in `BackgammonBrain_Atom_Pergame_11_20_25.py` and why it represents a fundamental shift in how the AI learns backgammon.
 
 ## The Problem: "Blindfolded" Learning
 
