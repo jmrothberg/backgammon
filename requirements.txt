@@ -1,0 +1,6 @@
+# Backgammon Game Dependencies
+
+pygame>=2.0.0          # Game graphics and UI
+torch>=1.9.0           # PyTorch for LLM inference
+numpy>=1.21.0          # Numerical operations
+tkinter                # GUI components (usually included with Python)
