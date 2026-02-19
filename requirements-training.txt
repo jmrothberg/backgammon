@@ -1,0 +1,5 @@
+# Everything needed for playing
+-r requirements.txt
+
+# Additional dependencies for training
+transformers>=4.20.0     # Adafactor optimizer used by BackgammonBrain

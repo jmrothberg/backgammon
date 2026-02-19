@@ -1,241 +1,135 @@
 # Backgammon with LLM-Powered AI
 
-A sophisticated backgammon game implementation featuring both traditional search-based AI and cutting-edge large language model (LLM) integration for intelligent move prediction.
+A backgammon game where you play against a transformer neural network trained on expert games. The AI learns move patterns from thousands of GNU Backgammon games and predicts moves autoregressively, like a language model predicts words.
 
-## 🎯 Features
+When the neural network can't find a legal move, the game falls back to a traditional search-based AI (minimax with alpha-beta pruning).
 
-- **Human vs AI Gameplay**: Play against intelligent AI opponents
-- **Dual AI Systems**:
-  - **LLM-Powered AI**: Uses transformer models trained on backgammon games for strategic play
-  - **Traditional Search AI**: Fallback system using minimax with alpha-beta pruning
-- **Complete Game State Tracking**: Maintains full game history for LLM context
-- **Debug-Friendly Architecture**: Comprehensive logging and error handling
-- **Atomic Tokenization**: Advanced move representation system
-- **Automatic Fallback**: Seamlessly switches from LLM to search AI when needed
+## File Guide
 
-## 🚀 Quick Start
+### Playing the Game
 
-### Prerequisites
+| File | What it does |
+|------|-------------|
+| `backgammon_Atom_Dec_11_25.py` | **The game.** Pygame UI, board rendering, game rules, human vs AI play. Run this to play. Imports the inference engine for AI moves. |
+| `BackgammonMovePredictor_Standalone_Atom.py` | **Inference engine.** Loads a trained `.pth` model and predicts moves given the game history and a dice roll. The game imports `BackgammonMovePredictor` from this file. Contains a copy of the model architecture (so it can reconstruct the network from saved weights) plus the prediction logic: joint-probability search for normal rolls (2 moves), beam search for doubles (4 moves). Called "Standalone" because it works without importing the training script. |
+| `requirements.txt` | Python dependencies for playing (`pygame`, `torch`, `numpy`). |
 
-**For Playing the Game:**
-- Python 3.8+
-- PyGame
-- PyTorch (for LLM inference)
-- NumPy
+### Training the AI
 
-**For Training AI Models:**
-- GNU Backgammon (http://www.gnu.org/software/gnubg/) - for generating expert-level training games
-- Large dataset of SGF format backgammon games
-- Significant computational resources (GPU recommended for training)
+| File | What it does |
+|------|-------------|
+| `BackgammonBrain_Atom_Pergame_11_20_25.py` | **Training script.** Defines the transformer architecture (Grouped Query Attention, RMSNorm, SwiGLU), loads tokenized game data, and trains the model. Uses a "per-game" strategy where every training sequence starts at `<STARTGAME>` so the model always sees full game context. Outputs `.pth` checkpoint files. Requires a GPU. |
+| `generate_backgammon_games.py` | **Data generation.** Runs GNU Backgammon (`gnubg`) in headless mode to produce expert-level games in SGF format. Supports parallel generation across multiple CPU cores. |
+| `setup_backgammon_games.sh` | **Setup helper.** Shell script that installs GNU Backgammon (via Homebrew on macOS or apt on Linux) and then runs `generate_backgammon_games.py` to produce training games. |
+| `convert_old_to_atomic_format.py` | **Data converter.** Converts older combined-token format to the current atomic format: splits `d41` into `d4 d1`, splits `m_lpab` into `m_lp m_ab`, and adds `<EOM>` turn markers. |
+| `README_BACKGAMMON_PER_GAME.md` | Explains why the per-game training strategy works better than the old overlapping-window approach. |
 
-### Installation
+### Other
 
-1. Clone the repository:
+| File | What it does |
+|------|-------------|
+| `.gitignore` | Excludes model checkpoints (`.pth`), game data (`.sgf`), virtual environments, and OS files from git. |
+
+## How the Pieces Fit Together
+
+```
+1. GENERATE DATA        2. CONVERT FORMAT       3. TRAIN MODEL           4. PLAY
+
+setup_backgammon_       convert_old_to_         BackgammonBrain_         backgammon_Atom_
+games.sh                atomic_format.py        Atom_Pergame.py          Dec_11_25.py
+    |                       |                       |                       |
+    v                       v                       v                       v
+Install gnubg +         .sgf/.txt games  -->    Atomic token     -->    Trained .pth    -->  Pygame UI
+generate_backgammon_    "d41 m_lpab"            files                    model file           (human plays
+games.py                    |                   "d4 d1 m_lp m_ab"           |                 against AI)
+    |                       v                       |                       |
+    v                   Atomic format               v                       v
+Expert .sgf games       training data           .pth checkpoint     BackgammonMovePredictor_
+                                                                    Standalone_Atom.py
+                                                                    (loads model, predicts moves)
+```
+
+## Quick Start
+
+### Play the Game
+
 ```bash
 git clone https://github.com/jmrothberg/backgammon.git
 cd backgammon
-```
-
-2. Install dependencies:
-```bash
-pip install pygame torch numpy
-```
-
-3. Run the game:
-```bash
+pip install -r requirements.txt
 python backgammon_Atom_Dec_11_25.py
 ```
 
-## 🎮 How to Play
-
-### Basic Rules
-- **Objective**: Be the first to bear off all your pieces
-- **Movement**: Roll dice and move pieces along the board
-- **Hitting**: Land on opponent's single piece to send it to the bar
-- **Bearing Off**: Remove pieces from your home board when all pieces are there
+The game will prompt you to select a `.pth` model file. If no model is available, it uses the search-based AI.
 
 ### Controls
+
 - **Left Click**: Select and move pieces
-- **Right Click**: Deselect piece
-- **Roll Dice**: Click the dice area when it's your turn
-- **Auto-Roll**: Toggle automatic dice rolling in settings
+- **Right Click**: Deselect
+- **Dice Area**: Click to roll
 
-### AI Opponents
-- **LLM AI**: Uses trained transformer models for strategic play (requires model file `.pth`)
-- **Search AI**: Traditional AI using position evaluation (always available as fallback)
+### Train Your Own Model
 
-The game automatically falls back to Search AI when:
-- No model file is loaded
-- LLM prediction fails to parse
-- LLM suggests illegal moves
-
-## 🧠 AI Architecture
-
-### Transformer Model
-The backgammon AI uses a custom transformer architecture optimized for game move prediction:
-
-- **MultiQueryAttention (GQA)**: Memory-efficient attention with grouped query heads
-- **RMSNorm**: Faster normalization that improves training stability
-- **SwiGLU Activation**: Better than standard ReLU/GELU for language models
-- **Game Boundary Masking**: Prevents attention across different games in training batches
-- **Autoregressive Generation**: Predicts next move token given full game context
-
-### Tokenization System (Atomic Format)
-- **Dice Tokens**: `d1` through `d6` for individual dice values
-- **Move Tokens**: `m_xy` pairs where x=source position, y=destination (using SGF notation a-x)
-- **Special Tokens**: `<STARTGAME>`, `<EOFG>`, `<EOM>` (end of move), `<NOMOVE>`, `<PAD>`
-- **Position Notation**: a-x = board positions 1-24, y = bar, z = bearing off
-
-### LLM Integration
-The game integrates with `BackgammonMovePredictor_Standalone_Atom.py`, which provides:
-- **Device-Aware Inference**: Automatically uses GPU/CPU/MPS based on availability
-- **Atomic Tokenization**: Efficient move representation with paired move tokens
-- **Context-Aware Prediction**: Uses full game history for strategic decision making
-- **Beam Search**: For doubles (4 moves), uses beam search to find optimal move sequences
-
-### Training Data
-The project includes tools for generating and processing backgammon game data:
-- `generate_backgammon_games.py`: Creates training games
-- `convert_old_to_atomic_format.py`: Processes game data for training
-- SGF format game databases (excluded from repo due to size)
-
-### Training the AI Model
-- `BackgammonBrain_Atom_Pergame_11_20_25.py`: Complete transformer training implementation
-  - Trains from expert GNU Backgammon games
-  - Uses per-game training strategy for better learning
-  - Produces models that can be used with the inference engine
-
-## 🏗️ Training Prerequisites & Data Generation
-
-### GNU Backgammon Setup
-To train the AI model, you need expert-level backgammon games. The best source is GNU Backgammon:
-
-1. **Download GNU Backgammon**:
-   - Visit: http://www.gnu.org/software/gnubg/
-   - Download the appropriate version for your operating system
-   - Install the program
-
-2. **Generate Training Games**:
+1. Install GNU Backgammon and generate training games:
    ```bash
-   # Run GNU Backgammon and use its analysis features to generate games
-   # Save games in SGF format (Smart Game Format)
+   ./setup_backgammon_games.sh 1000
+   ```
+   Or manually:
+   ```bash
+   # macOS
+   brew install gnubg
+   # Linux
+   sudo apt-get install gnubg
+
+   python generate_backgammon_games.py 1000 ./backgammon_games
    ```
 
-### Using the Game Generator Script
-The included `generate_backgammon_games.py` is a wrapper that automates GNU Backgammon to generate training games:
+2. Convert to atomic token format:
+   ```bash
+   python convert_old_to_atomic_format.py
+   ```
 
-```bash
-# Generate 1000 games in the output directory
-python generate_backgammon_games.py 1000 ./backgammon_games
+3. Train (requires GPU):
+   ```bash
+   pip install -r requirements-training.txt
+   python BackgammonBrain_Atom_Pergame_11_20_25.py
+   ```
 
-# With instance ID and worker count for parallel generation
-python generate_backgammon_games.py 1000 ./backgammon_games 0 32
-```
+4. Play with your trained model:
+   ```bash
+   python backgammon_Atom_Dec_11_25.py
+   ```
 
-**Important**: This script requires GNU Backgammon (`gnubg`) to be installed and accessible from the command line. It runs gnubg in headless mode to generate expert-level games.
+## Tokenization
 
-### Data Processing Pipeline
-1. **Install GNU Backgammon**: Download from http://www.gnu.org/software/gnubg/
-2. **Generate SGF Games**: Use `generate_backgammon_games.py` to create expert-level games
-3. **Convert to Atomic Format**: Use `convert_old_to_atomic_format.py` to tokenize game data
-   - Splits dice tokens: `d41` → `d4 d1`
-   - Splits move tokens: `m_lpab` → `m_lp m_ab`
-   - Adds turn markers: `<EOM>` after each turn
-4. **Train Model**: Run `BackgammonBrain_Atom_Pergame_11_20_25.py` on the processed data
-5. **Deploy**: Use trained model with `BackgammonMovePredictor_Standalone_Atom.py`
+The AI represents games as token sequences using "atomic" format:
 
-### Training Data Requirements
-- **Quality**: Expert-level games preferred (GNU Backgammon analysis)
-- **Quantity**: Thousands of games for meaningful training
-- **Format**: SGF files (standard backgammon game format)
-- **Processing**: Convert to atomic tokenization format before training
+| Token | Meaning | Example |
+|-------|---------|---------|
+| `d1`-`d6` | Individual die value | `d5 d2` = rolled 5 and 2 |
+| `m_xy` | Move from position x to position y | `m_lp` = move from position l to p |
+| `<EOM>` | End of turn | Separates one player's moves from the next |
+| `<STARTGAME>` | Beginning of a game | Always the first token |
+| `<EOFG>` | End of game | Always the last token |
+| `<NOMOVE>` | No legal move available | Player must pass |
+| `<PAD>` | Padding | Fills short sequences to fixed length during training |
 
-### Model Hyperparameters
-Default training configuration (can be adjusted in `BackgammonBrain_Atom_Pergame_11_20_25.py`):
+Position notation uses SGF-style letters: `a`-`x` = board positions 1-24, `y` = bar, `z` = bear off.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `n_embd` | 384 | Embedding dimension |
-| `n_head` | 8 | Number of attention heads |
-| `n_kv_heads` | 2 | Key-value heads (GQA) |
-| `n_layer` | 8 | Transformer layers |
-| `block_size` | 512 | Max sequence length |
-| `dropout` | 0.1 | Dropout rate |
-| `batch_size` | 128 | Training batch size |
-| `learning_rate` | 4e-4 | Initial learning rate |
+## Model Architecture
 
-## 🛠️ Project Structure
+The transformer uses techniques from modern LLMs, scaled down for backgammon:
 
-```
-backgammon/
-├── backgammon_Atom_Dec_11_25.py          # Main game file
-├── BackgammonBrain_Atom_Pergame_11_20_25.py    # Transformer training script
-├── BackgammonMovePredictor_Standalone_Atom.py  # LLM inference engine
-├── generate_backgammon_games.py          # Game data generation
-├── convert_old_to_atomic_format.py       # Data processing
-├── README_BACKGAMMON_PER_GAME.md         # Training strategy docs
-├── .gitignore                           # Excludes data files
-└── README.md                            # This file
-```
+- **Grouped Query Attention (GQA)**: 8 query heads, 2 key-value heads (memory efficient)
+- **RMSNorm**: Faster and more stable than LayerNorm
+- **SwiGLU**: Better activation function than ReLU/GELU
+- **Game Boundary Masking**: Prevents attention across different games in training batches
+- Default: 8 layers, 384 embedding dim, 512 max sequence length (~35M parameters)
 
-## 🔧 Configuration
+## Troubleshooting
 
-### LLM Setup
-The game automatically detects and uses the LLM predictor if available. To disable LLM features, modify the import section in `backgammon_Atom_Dec_11_25.py`.
+**No LLM moves / falls back to Search AI**: Make sure `BackgammonMovePredictor_Standalone_Atom.py` is in the same directory as the game and that you have a `.pth` model file loaded.
 
-### Debug Mode
-Enable detailed logging by checking terminal output for:
-- ✅ Success indicators
-- ❌ Error messages
-- 🔄 AI thinking processes
-- ⚠️ Warning messages
+**Game freezes**: Check terminal output for error messages. The game logs all AI decisions with indicator prefixes.
 
-## 🐛 Troubleshooting
-
-### Common Issues
-
-1. **LLM Not Available**
-   - Ensure `BackgammonMovePredictor_Standalone_Atom.py` is in the same directory
-   - Check PyTorch installation
-   - Game falls back to search AI automatically
-
-2. **Game Freezes**
-   - Check dice validation in `is_valid_move()` function
-   - Verify board state integrity
-   - Look for "board[:]" copying issues in logs
-
-3. **Invalid Moves**
-   - Ensure dice match available moves
-   - Check board position calculations
-   - Verify move token parsing
-
-### Debug Workflow
-1. Check terminal output for emoji indicators
-2. Look for "LLM_AI thinking" vs "Search AI evaluating"
-3. Verify `game_history_tokens` format
-4. Check board state with debug prints if needed
-
-## 📚 Documentation
-
-- `README_BACKGAMMON_PER_GAME.md`: Detailed explanation of the per-game training strategy
-- Code comments include comprehensive debugging guides
-- Inline documentation covers key algorithms and data structures
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly (both LLM and search AI modes)
-5. Submit a pull request
-
-## 📄 License
-
-This project is open source. Please check individual files for license information.
-
-## 🙏 Acknowledgments
-
-- Built with PyGame for graphics
-- LLM components use PyTorch
-- Training data generated using custom game engines
-- Special thanks to the backgammon community for game databases
+**Training out of memory**: Reduce `batch_size` in `BackgammonBrain_Atom_Pergame_11_20_25.py`.
