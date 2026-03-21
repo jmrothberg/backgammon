@@ -1,0 +1,8 @@
+# OBSOLETE FILENAME — do not use this file for new installs.
+#
+# Use the canonical files (see README.md → Dependencies):
+#   pip install -r requirements.txt                 # play / inference only
+#   pip install -r requirements-training.txt        # training + plotting helpers
+#
+# This file used to duplicate pins; those are merged into requirements.txt and
+# requirements-training.txt so there is a single place to maintain versions.

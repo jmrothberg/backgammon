@@ -1,5 +1,10 @@
-# Everything needed for playing
+# Training + optional tooling: includes everything in requirements.txt, then adds
+# packages used by BackgammonBrain_Atom_Pergame_11_20_25.py and helper scripts.
+
 -r requirements.txt
 
-# Additional dependencies for training
-transformers>=4.20.0     # Adafactor optimizer used by BackgammonBrain
+# Training (transformer stack uses Adafactor from here)
+transformers>=4.20.0
+
+# Plotting checkpoint loss (e.g. plot_loss_Nov_9_25.py)
+matplotlib>=3.5.0

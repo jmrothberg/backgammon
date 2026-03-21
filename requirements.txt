@@ -1,3 +1,4 @@
-pygame>=2.0.0
-torch>=1.9.0
+# Minimal deps to run the Pygame client and load a trained model for inference.
+pygame>=2.5.0
+torch>=2.0.0
 numpy>=1.21.0

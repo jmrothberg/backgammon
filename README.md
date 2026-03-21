@@ -4,6 +4,24 @@ A backgammon game where you play against a transformer neural network trained on
 
 When the neural network can't find a legal move, the game falls back to a traditional search-based AI (minimax with alpha-beta pruning).
 
+## Dependencies
+
+| What you want | Install command |
+|-----------------|-----------------|
+| **Play** (Pygame UI + PyTorch to run the trained model) | `pip install -r requirements.txt` |
+| **Train** the model, or use plotting / training-adjacent scripts | `pip install -r requirements-training.txt` |
+
+`requirements-training.txt` includes everything from `requirements.txt` and adds `transformers` (training optimizer) and `matplotlib` (e.g. plotting loss from checkpoints).
+
+Recommended: use a virtual environment so this project does not affect your system Python.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+```
+
+**Note:** `Backgammon_requirements.txt` is deprecated; pins live only in `requirements.txt` and `requirements-training.txt`.
+
 ## File Guide
 
 ### Playing the Game
@@ -12,7 +30,8 @@ When the neural network can't find a legal move, the game falls back to a tradit
 |------|-------------|
 | `backgammon_Atom_Dec_11_25.py` | **The game.** Pygame UI, board rendering, game rules, human vs AI play. Run this to play. Imports the inference engine for AI moves. |
 | `BackgammonMovePredictor_Standalone_Atom.py` | **Inference engine.** Loads a trained `.pth` model and predicts moves given the game history and a dice roll. The game imports `BackgammonMovePredictor` from this file. Contains a copy of the model architecture (so it can reconstruct the network from saved weights) plus the prediction logic: joint-probability search for normal rolls (2 moves), beam search for doubles (4 moves). Called "Standalone" because it works without importing the training script. |
-| `requirements.txt` | Python dependencies for playing (`pygame`, `torch`, `numpy`). |
+| `requirements.txt` | Minimal Python dependencies for playing (see [Dependencies](#dependencies)). |
+| `requirements-training.txt` | Everything above plus packages for training and optional tooling (see [Dependencies](#dependencies)). |
 
 ### Training the AI
 
@@ -23,12 +42,24 @@ When the neural network can't find a legal move, the game falls back to a tradit
 | `setup_backgammon_games.sh` | **Setup helper.** Shell script that installs GNU Backgammon (via Homebrew on macOS or apt on Linux) and then runs `generate_backgammon_games.py` to produce training games. |
 | `convert_old_to_atomic_format.py` | **Data converter.** Converts older combined-token format to the current atomic format: splits `d41` into `d4 d1`, splits `m_lpab` into `m_lp m_ab`, and adds `<EOM>` turn markers. |
 | `README_BACKGAMMON_PER_GAME.md` | Explains why the per-game training strategy works better than the old overlapping-window approach. |
+| `Backgammon_SGF_to_TXT_Converter_Atom.py` | Optional: GUI tool — folder of `.sgf` games → one atomic-token `.txt` for training pipelines. |
+| `plot_loss_Nov_9_25.py` | Optional: scan a checkpoint folder and plot loss vs training step from filenames. |
 
 ### Other
 
 | File | What it does |
 |------|-------------|
 | `.gitignore` | Excludes model checkpoints (`.pth`), game data (`.sgf`), virtual environments, and OS files from git. |
+
+## Documentation
+
+| Document | Purpose |
+|----------|---------|
+| `README.md` (this file) | Setup, file map, quick start, tokenization overview. |
+| `README_BACKGAMMON_PER_GAME.md` | Why per-game training sequences beat sliding windows. |
+| `Backgammon_README.md` | Longer reference: rules, board mapping, SGF notation. |
+| `README_BackgammonMovePredictor_Standalone.md` | Inference-only API, GPU device mapping, loading models on different hardware. |
+| `ATOMIC_TOKENIZATION_IMPLEMENTATION_GUIDE.md` | Design and migration notes for atomic tokenization. |
 
 ## How the Pieces Fit Together
 
@@ -56,6 +87,7 @@ Expert .sgf games       training data           .pth checkpoint     BackgammonMo
 ```bash
 git clone https://github.com/jmrothberg/backgammon.git
 cd backgammon
+python3 -m venv .venv && source .venv/bin/activate   # optional but recommended
 pip install -r requirements.txt
 python backgammon_Atom_Dec_11_25.py
 ```
