@@ -839,11 +839,10 @@ class BackgammonModel(nn.Module):
                 with torch.no_grad():
                     mask = self.is_move_vec.to(targets_flat.device)[targets_flat]
                 w = mask * token_weights.reshape(-1)
-                num_move_tokens = int((mask > 0).sum().item())
-                if num_move_tokens > 0:
-                    loss = (per_tok * w).sum() / w.sum().clamp(min=1.0)
-                else:
-                    loss = torch.tensor(0.0, device=logits_flat.device)
+                # Keep the count on device. .item() here splits torch.compile and does not change the loss.
+                # Zero move tokens already give loss 0: numerator is 0, clamp keeps the denominator at 1.
+                num_move_tokens = (mask > 0).sum()
+                loss = (per_tok * w).sum() / w.sum().clamp(min=1.0)
             else:
                 per_tok = F.cross_entropy(logits_flat, targets_flat, reduction='none')
                 w = token_weights.reshape(-1)
@@ -2661,7 +2660,10 @@ def _train_backgammon_model_core(text, checkpoint_data=None):
                     # Clip gradients
                     torch.nn.utils.clip_grad_norm_(model_gpu.parameters(), clip_threshold)
 
-                    # Accumulate weighted loss for correct reporting
+                    # Accumulate weighted loss for correct reporting.
+                    # Forward returns a device count so compile stays one graph; read it here, outside compile.
+                    if torch.is_tensor(num_tokens):
+                        num_tokens = int(num_tokens.item())
                     batch_weighted_loss_sum += loss.item() * num_tokens
                     batch_total_tokens += num_tokens
 

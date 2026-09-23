@@ -588,7 +588,27 @@ def llm_ai_move(dice, moves_left_ai, game_history_tokens, player):
         history_for_model = game_history
         if hasattr(llm_predictor, 'with_result_token'):
             history_for_model = llm_predictor.with_result_token(game_history, f'<{side}>')
-        all_sequences = llm_predictor.predict_moves(history_for_model, dice_token, top_k=5)
+        def legal_fn(moves_so_far):
+            # What is_valid_move allows after these checkers, on a copy of the board.
+            # The model is only allowed to continue with one of these tokens.
+            replayed = replay_moves(moves_so_far, player, dice)
+            if replayed is None:
+                return ['<EOM>']
+            test_board, test_bar, test_dice, _moves = replayed
+            tokens = legal_move_tokens(player, test_dice, test_board, test_bar)
+            if tokens:
+                return tokens
+            # Nothing left to play: <NOMOVE> at the start of the turn, otherwise <EOM>.
+            return ['<NOMOVE>'] if not moves_so_far else ['<EOM>']
+
+        all_sequences = llm_predictor.predict_moves(
+            history_for_model, dice_token, top_k=5, legal_fn=legal_fn,
+        )
+        # The beam above is masked to legal turns. This is the model's own top token
+        # before that mask, so a weak checkpoint is still obvious.
+        raw_first = getattr(llm_predictor, 'last_unmasked_first', None)
+        if raw_first and raw_first not in set(legal_fn([])):
+            print(f"LLM 1st choice was not legal: {raw_first} (not a legal checker from this position)")
 
         print(f"🤖 LLM_AI RAW RESPONSES: {len(all_sequences)} sequences")
         
@@ -625,101 +645,32 @@ def llm_ai_move(dice, moves_left_ai, game_history_tokens, player):
                          print(f"LLM 1st choice was not legal: {sequence} ({reject_reason})")
                 continue
             
-            # Simulate the sequence. Execution happens after every candidate is scored.
-            import copy
-            test_board = copy.deepcopy(board)
-            test_bar = copy.deepcopy(bar)
-            test_dice = list(dice)
-            
-            valid_sequence = True
-            moves_to_make = []
-            
-            for move_token in sequence:
-                 if move_token == '<EOM>':
-                     break
-                 if not move_token.startswith('m_'):
-                     continue
-                     
-                 start, end = token_to_positions(move_token, test_dice, player)
-                 
-                 if start is None or end is None:
-                     valid_sequence = False
-                     reject_reason = f"could not parse {move_token}"
-                     print(f"   ❌ Could not parse or illegal move: {move_token}")
-                     break
-                 
-                 # Check legality on test board
-                 # token_to_positions calls is_valid_move but on the REAL board/dice?
-                 # No, token_to_positions uses the 'dice' argument passed to it, 
-                 # but it accesses the global 'board' by default in is_valid_move call unless we pass board.
-                 
-                 # Fix: We need to call is_valid_move with test_board
-                 if not is_valid_move(start, end, test_dice, player, test_board, test_bar):
-                     valid_sequence = False
-                     reject_reason = f"illegal on the board: {move_token}"
-                     print(f"   ❌ Illegal move on simulated board: {move_token}")
-                     break
-                     
-                 moves_to_make.append((start, end, move_token))
-                 
-                 # Update test state
-                 # Apply move to test_board
-                 move_distance = abs(end - start) if end not in [0, 25, 26] else (25 - start if player == -1 else start)
-                 
-                 if start == 25 or start == -1:  # From bar
-                    test_bar[0 if player == 1 else 1] -= 1
-                 elif start >= 1 and start <= BOARD_SIZE:
-                    test_board[start] -= player
-                    
-                 if end == 0 or end == 25 or end == 26:  # Bearing off
-                    pass
-                 elif end >= 1 and end <= BOARD_SIZE:
-                    if test_board[end] * player < 0 and abs(test_board[end]) == 1:  # Hit opponent
-                        test_bar[1 if player == 1 else 0] += 1
-                        test_board[end] = player
-                    else:
-                        test_board[end] += player
-
-                 # Update dice
-                 dice_used = False
-                 for j in range(len(test_dice)):
-                    if test_dice[j] == move_distance and test_dice[j] < 7:
-                        test_dice[j] = 7
-                        dice_used = True
-                        break
-                 
-                 if not dice_used:
-                     # Could be bearing off with higher die
-                     for j in range(len(test_dice)):
-                        if test_dice[j] > move_distance and test_dice[j] < 7:
-                             test_dice[j] = 7
-                             dice_used = True
-                             break
-                 
-                 if not dice_used:
-                     valid_sequence = False
-                     reject_reason = f"no matching die for {move_token}"
-                     print(f"   ❌ No matching die for move: {move_token}")
-                     break
-            
-            # === CRITICAL: CHECK FOR INCOMPLETE TURNS ===
-            # If sequence is valid so far, verify if it used all possible moves
-            # We don't want "half moves" (lazy AI) where it stops but could continue
-            if valid_sequence:
-                # Collect remaining unused dice from simulation
-                remaining_dice = [d for d in test_dice if d < 7]
-                
-                if remaining_dice and has_valid_moves(player, remaining_dice, test_board, test_bar):
+            # Same board change as make_move, on a copy. A turn that passes here is the turn that is played.
+            replayed = replay_moves(sequence, player, dice)
+            moves_to_make = None
+            if replayed is None:
+                reject_reason = "illegal on the board"
+                print(f"   ❌ Illegal move on simulated board: {sequence}")
+            else:
+                test_board, test_bar, test_dice, moves_to_make = replayed
+                # === CRITICAL: CHECK FOR INCOMPLETE TURNS ===
+                # If sequence is valid so far, verify if it used all possible moves
+                # We don't want "half moves" (lazy AI) where it stops but could continue
+                remaining_dice = [d for d in test_dice if 0 < d < 7]
+                if not moves_to_make:
+                    reject_reason = "no checker moves"
+                    moves_to_make = None
+                elif remaining_dice and has_valid_moves(player, remaining_dice, test_board, test_bar):
                     # If valid moves remain, the LLM sequence is incomplete!
                     # REJECT IT to force fallback to Search AI for a full turn
-                    valid_sequence = False
                     reject_reason = f"turn incomplete, moves remain with dice {remaining_dice}"
                     print(f"   ❌ Sequence incomplete - valid moves remain with dice {remaining_dice}")
                     # Note: We set valid_sequence=False so the loop continues to the next candidate
                     # If all candidates are incomplete, the loop finishes with valid_sequence=False
                     # and the function returns None, triggering full search AI fallback.
+                    moves_to_make = None
 
-            if valid_sequence and moves_to_make:
+            if moves_to_make:
                 legal_found.append({
                     'rank': rank, 'confidence': confidence, 'sequence': sequence,
                     'moves': list(moves_to_make), 'nomove': False,
@@ -768,15 +719,22 @@ def llm_ai_move(dice, moves_left_ai, game_history_tokens, player):
             except Exception as rerank_error:
                 print(f"Value re-rank skipped ({type(rerank_error).__name__}: {rerank_error})")
 
-        # first_legal means the model's own 1st choice was legal, even if the win-guesser played another.
-        first_legal_rank = legal_found[0]['rank']
+        # first_legal means the model's own unmasked 1st token was legal, even if the win-guesser played another.
         llm_stats['total_moves'] += 1
-        if first_legal_rank == 1:
+        opening_legal = set(legal_fn([]))
+        raw_first = getattr(llm_predictor, 'last_unmasked_first', None)
+        if raw_first in opening_legal:
             llm_stats['first_legal'] += 1
-        elif first_legal_rank == 2:
-            llm_stats['second_legal'] += 1
         else:
-            llm_stats['third_plus_legal'] += 1
+            order = getattr(llm_predictor, 'last_unmasked_order', []) or []
+            try:
+                raw_rank = order.index(legal_found[0]['sequence'][0]) + 1
+            except ValueError:
+                raw_rank = 3
+            if raw_rank == 2:
+                llm_stats['second_legal'] += 1
+            else:
+                llm_stats['third_plus_legal'] += 1
 
         if chosen['nomove']:
             return ('<NOMOVE>', 0)
@@ -1291,6 +1249,131 @@ def has_valid_moves(player, dice, board=board, bar=bar):
     return False      
 
     
+def apply_checker(board, bar, start, end, player):
+    """Board and bar change shared by make_move and the LLM turn check.
+
+    Returns 'off', 'hit', or 'move'. Does not draw and does not touch the dice.
+    The piece updates match make_move, so a turn accepted on a copy is the turn that gets played.
+    """
+    if player == 1:  # White player
+        if start == 25:  # White bar
+            bar[0] -= 1
+        else:
+            board[start] -= 1
+        if end == 0:  # Blue bears off to 0
+            return 'off'
+        if board[end] == -1:
+            board[end] = 1
+            bar[1] += 1
+            return 'hit'
+        board[end] += 1
+        return 'move'
+    # Black player
+    if start == -1:  # Black bar
+        bar[1] -= 1
+    else:
+        board[start] += 1
+    if end == 25:  # Red bears off to 25
+        return 'off'
+    if board[end] == 1:
+        board[end] = -1
+        bar[0] += 1
+        return 'hit'
+    board[end] -= 1
+    return 'move'
+
+
+def consume_die(dice, start, end, player, board_state):
+    """Mark the die make_move would consume. Used faces become 7.
+
+    make_move sets dice3/dice4 to 0. Both 0 and 7 fail the `0 < die < 7` test, so 7 is enough
+    on a copied dice list. Bearing off with a higher die uses the same closer-piece check as make_move.
+    """
+    if end == 0 or end == 25:
+        distance = start if player == 1 else 25 - start
+        choice = None
+        for d in dice:
+            if 0 < d < 7 and d == distance:
+                choice = d
+                break
+        if choice is None:
+            for d in dice:
+                if not (0 < d < 7 and d > distance):
+                    continue
+                if player == -1:
+                    closer = any(board_state[i] < 0 for i in range(start + 1, BOARD_SIZE + 1))
+                else:
+                    closer = any(board_state[i] > 0 for i in range(1, start))
+                if not closer:
+                    choice = d
+                    break
+        if choice is None:
+            return False
+    elif start == 25:  # White bar
+        choice = 25 - end
+    elif start == -1:  # Black bar
+        choice = end
+    else:
+        choice = abs(end - start)
+    for j, d in enumerate(dice):
+        if d == choice and 0 < d < 7:
+            dice[j] = 7
+            return True
+    return False
+
+
+def legal_move_tokens(player, dice, board_state, bar_state):
+    """Every m_* token is_valid_move accepts from this position. Same scan as has_valid_moves."""
+    found = []
+    seen = set()
+    for start in range(-1 if player == -1 else 1, (BOARD_SIZE + 2 if player == 1 else BOARD_SIZE + 1)):
+        if start == -1 and (bar_state[1] == 0 if player == -1 else True):
+            continue
+        if start == 25 and (bar_state[0] == 0 if player == 1 else True):
+            continue
+        if start >= 1 and start <= BOARD_SIZE:
+            if player == 1 and board_state[start] <= 0:
+                continue
+            if player == -1 and board_state[start] >= 0:
+                continue
+        for end in range(0, BOARD_SIZE + 2):
+            if not is_valid_move(start, end, dice, player, board_state, bar_state):
+                continue
+            tok = move_to_token(start, end, player)
+            if tok not in seen:
+                seen.add(tok)
+                found.append(tok)
+    return found
+
+
+def replay_moves(sequence, player, dice):
+    """Apply a token list with apply_checker. Returns None if any step is illegal.
+
+    Return is (board, bar, dice, moves) where moves is [(start, end, token), ...].
+    """
+    test_board = board[:]
+    test_bar = bar[:]
+    test_dice = list(dice)
+    moves_to_make = []
+    for move_token in sequence:
+        if move_token == '<EOM>':
+            break
+        if move_token == '<NOMOVE>':
+            break
+        if not isinstance(move_token, str) or not move_token.startswith('m_'):
+            continue
+        start, end = token_to_positions(move_token, test_dice, player)
+        if start is None or end is None:
+            return None
+        if not is_valid_move(start, end, test_dice, player, test_board, test_bar):
+            return None
+        apply_checker(test_board, test_bar, start, end, player)
+        if not consume_die(test_dice, start, end, player, test_board):
+            return None
+        moves_to_make.append((start, end, move_token))
+    return test_board, test_bar, test_dice, moves_to_make
+
+
 # Function to make a move on the board
 def make_move(start, end, player, moves_left=0, score=0):
     global white_pieces_off, black_pieces_off, dice1, dice2, dice3, dice4, bar
@@ -1312,12 +1395,10 @@ def make_move(start, end, player, moves_left=0, score=0):
         time.sleep(0.33)  # Show FROM highlight for 1/3 second
 
     # === STEP 2: Execute the actual move ===
+    # Same piece and bar update the LLM uses when it checks a turn on a copied board.
+    kind = apply_checker(board, bar, start, end, player)
     if player == 1:  # White player
-        if start == 25:  # White bar
-            bar[0] -= 1
-        else:
-            board[start] -= 1
-        if end == 0:  # Blue bears off to 0
+        if kind == 'off':  # Blue bears off to 0
             print(f"Blue's move: {idx_to_letter(start)}({start}) off the board")
             white_pieces_off += 1  # Increment the count of blue pieces off the board
             text = font.render (f"Blue: {idx_to_letter(start)}({start}) to off", True, BLACK)
@@ -1325,9 +1406,7 @@ def make_move(start, end, player, moves_left=0, score=0):
             text_rect = pygame.Rect(10, HEIGHT + 25 * (4-moves_left)+50, 300, 82)
             pygame.draw.rect(screen, WHITE_ISH, text_rect)
             screen.blit(text, (10, HEIGHT + 25 * (4-moves_left)+50))
-        elif board[end] == -1:
-            board[end] = 1
-            bar[1] += 1
+        elif kind == 'hit':
             print(f"White hits: {idx_to_letter(start)}({start}) to {idx_to_letter(end)}({end}), moves left: {moves_left}")
             text = font.render (f"White hits: {idx_to_letter(start)}({start}) to {idx_to_letter(end)}({end})", True, BLACK)
             # Clear the text area before drawing new text
@@ -1335,7 +1414,6 @@ def make_move(start, end, player, moves_left=0, score=0):
             pygame.draw.rect(screen, WHITE_ISH, text_rect)
             screen.blit(text, (10, HEIGHT + 25 * (4-moves_left)+50))
         else:
-            board[end] += 1
             print(f"Blue's move: {idx_to_letter(start)}({start}) to {idx_to_letter(end)}({end}), moves left: {moves_left}")
             text = font.render (f"Blue: {idx_to_letter(start)}({start}) to {idx_to_letter(end)}({end})", True, BLACK)
             # Clear the text area before drawing new text
@@ -1344,11 +1422,7 @@ def make_move(start, end, player, moves_left=0, score=0):
             screen.blit(text, (10, HEIGHT + 25 * (4-moves_left)+50))
 
     else:  # Black player (AI)
-        if start == -1:  # Black bar
-            bar[1] -= 1
-        else:
-            board[start] += 1
-        if end == 25:  # Red bears off to 25
+        if kind == 'off':  # Red bears off to 25
             print(f"Red's move: {idx_to_letter(start)}({start}) off the board")
             black_pieces_off += 1  # Increment the count of red pieces off the board
             text = font.render (f"Red: {idx_to_letter(start)}({start}) off  score {score}", True, BLACK)
@@ -1356,9 +1430,7 @@ def make_move(start, end, player, moves_left=0, score=0):
             text_rect = pygame.Rect(WIDTH//2 + 10, HEIGHT + 25 * (4-moves_left)+50, 350, 32)
             pygame.draw.rect(screen, WHITE_ISH, text_rect)
             screen.blit(text, (WIDTH//2 + 10, HEIGHT + 25 * (4-moves_left)+50))
-        elif board[end] == 1:
-            board[end] = -1
-            bar[0] += 1
+        elif kind == 'hit':
             print(f"Red hits: {idx_to_letter(start)}({start}) to {idx_to_letter(end)}({end}), score {score}, moves left: {moves_left}")
             text = font.render (f"Red hits: {idx_to_letter(start)}({start}) to {idx_to_letter(end)}({end})  score {int(score)}", True, BLACK)
             # Clear the text area before drawing new text
@@ -1366,7 +1438,6 @@ def make_move(start, end, player, moves_left=0, score=0):
             pygame.draw.rect(screen, WHITE_ISH, text_rect)
             screen.blit(text, (WIDTH//2 + 10, HEIGHT + 25 * (4-moves_left)+50))
         else:
-            board[end] -= 1
             print(f"Red's move: {idx_to_letter(start)}({start}) to {idx_to_letter(end)}({end}), moves left: {moves_left}, Score: {score}")
             text = font.render (f"Red: {idx_to_letter(start)}({start}) to {idx_to_letter(end)}({end})  score {int(score)}", True, BLACK)
             # Clear the text area before drawing new text

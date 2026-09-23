@@ -278,209 +278,179 @@ def is_doubles(dice_roll):
     """Check if dice roll is doubles."""
     return len(dice_roll) == 2 and dice_roll[0] == dice_roll[1]
 
-def get_top_k_pairs(model, dice_tokens, idx_to_move, move_to_idx, device, k=10, game_history=[]):
+def _fit_block(ids, block_size):
+    """Keep the opening two tokens and the newest tail when the game is longer than the block.
+
+    The opening two are <STARTGAME> and the result token (<W>, <B>, or <U>).
+    Dropping them makes a long game forget which side is moving. The win-guesser uses this same cut.
+    """
+    if len(ids) <= block_size:
+        return list(ids)
+    head = 2 if block_size > 2 else 0
+    return list(ids[:head]) + list(ids[-(block_size - head):])
+
+def _batched_next_probs(model, contexts, device):
+    """One forward for every partial turn. Logits are read at the last real token.
+
+    Right-padding is safe because attention is causal: a pad after the real tokens
+    cannot change the probability of the next move. Returns probs [batch, vocab].
+    """
+    block = model.block_size
+    fitted = [_fit_block(c, block) for c in contexts]
+    lengths = [max(len(c), 1) for c in fitted]
+    max_t = max(lengths)
+    batch = torch.zeros((len(fitted), max_t), dtype=torch.long, device=device)
+    for i, c in enumerate(fitted):
+        if c:
+            batch[i, :len(c)] = torch.tensor(c, dtype=torch.long, device=device)
+    logits, _ = model(batch)
+    rows = torch.arange(len(fitted), device=device)
+    cols = torch.tensor([n - 1 for n in lengths], device=device)
+    return torch.softmax(logits[rows, cols], dim=-1)
+
+def get_top_k_sequences(model, dice_tokens, idx_to_move, move_to_idx, device, k=10, game_history=None, max_moves=2, legal_fn=None):
+    """Top-k finished turns.
+
+    legal_fn(moves_so_far) lists the tokens that are legal on the board after those moves.
+    When it is given, only those tokens are expanded, in one batched forward per checker.
+    A turn is returned only when no checker can still be played (<EOM> or <NOMOVE>), or the
+    dice are used up. A one-checker answer is not returned while a die can still move.
+
+    Without legal_fn (no board), the model's own <EOM> / <NOMOVE> ends the turn.
+
+    Also records the unmasked top token at the first checker, so play can still say when
+    the model's own first choice was illegal.
+    """
+    if game_history is None:
+        game_history = []
+    model.eval()
+    info = {'unmasked_first': None, 'unmasked_order': []}
+
+    context_indices = [move_to_idx[token] for token in (list(game_history) + list(dice_tokens)) if token in move_to_idx]
+    # (token ids, probability so far, move tokens)
+    active = [(context_indices, 1.0, [])]
+    finished = []
+    # How many legal continuations to keep on each partial turn before the beam cut.
+    # Keep enough legal first moves that the best finished turn is still in the beam.
+    branch = 30
+    beam_width = max(k * 4, branch)
+    eom_id = move_to_idx.get('<EOM>')
+    nomove_id = move_to_idx.get('<NOMOVE>')
+
+    with torch.no_grad():
+        for step in range(max_moves):
+            if not active:
+                break
+            probs = _batched_next_probs(model, [seq[0] for seq in active], device)
+            nxt = []
+            for i, (context, prob, moves) in enumerate(active):
+                step_probs = probs[i]
+                if step == 0 and i == 0:
+                    order_ids = torch.argsort(step_probs, descending=True)
+                    order = []
+                    for idx in order_ids.tolist():
+                        token = idx_to_move.get(idx)
+                        if token and (token.startswith('m_') or token in ('<NOMOVE>', '<EOM>')):
+                            order.append(token)
+                        if len(order) >= 30:
+                            break
+                    info['unmasked_order'] = order
+                    info['unmasked_first'] = order[0] if order else idx_to_move.get(int(torch.argmax(step_probs).item()))
+
+                allowed = None
+                if legal_fn is not None:
+                    allowed = set(legal_fn(moves))
+                    move_tokens = [t for t in allowed if t.startswith('m_') and t in move_to_idx]
+                    # No checker left: this partial turn is finished. Do not return it as a half turn.
+                    if not move_tokens:
+                        if '<NOMOVE>' in allowed and not moves and nomove_id is not None:
+                            finished.append((prob * step_probs[nomove_id].item(), ['<NOMOVE>']))
+                        elif eom_id is not None and moves:
+                            finished.append((prob * step_probs[eom_id].item(), list(moves)))
+                        continue
+                    cand = [(step_probs[move_to_idx[t]].item(), move_to_idx[t], t) for t in move_tokens]
+                else:
+                    # No board here. Take the model's own move / stop tokens.
+                    top_n = min(20, step_probs.shape[0])
+                    cand = []
+                    for idx in torch.argsort(step_probs, descending=True)[:top_n].tolist():
+                        token = idx_to_move.get(idx)
+                        if not token:
+                            continue
+                        if token == '<NOMOVE>' and not moves:
+                            finished.append((prob * step_probs[idx].item(), ['<NOMOVE>']))
+                            continue
+                        if token == '<EOM>' and moves:
+                            finished.append((prob * step_probs[idx].item(), list(moves)))
+                            continue
+                        if token.startswith('m_'):
+                            cand.append((step_probs[idx].item(), idx, token))
+
+                cand.sort(key=lambda item: item[0], reverse=True)
+                for step_prob, idx, token in cand[:branch]:
+                    nxt.append((context + [idx], prob * step_prob, moves + [token]))
+
+            nxt.sort(key=lambda item: item[1], reverse=True)
+            active = nxt[:beam_width]
+
+        # Dice are used up. Keep the turn only when the board agrees nothing is left to play.
+        # Multiply by P(<EOM>) so a short finished turn and a full turn are scored the same way.
+        if active and legal_fn is not None:
+            kept = []
+            for context, prob, moves in active:
+                allowed = set(legal_fn(moves))
+                if not any(t.startswith('m_') for t in allowed):
+                    kept.append((context, prob, moves))
+            if kept and eom_id is not None:
+                end_probs = _batched_next_probs(model, [seq[0] for seq in kept], device)
+                for i, (context, prob, moves) in enumerate(kept):
+                    finished.append((prob * end_probs[i, eom_id].item(), moves))
+            else:
+                finished.extend((prob, moves) for _context, prob, moves in kept)
+        elif active and legal_fn is None:
+            finished.extend((prob, moves) for _context, prob, moves in active if moves)
+
+    finished.sort(key=lambda item: item[0], reverse=True)
+    # Same moves reached by two paths: keep the higher probability.
+    seen = set()
+    results = []
+    for prob, moves in finished:
+        key = tuple(moves)
+        if not moves or key in seen:
+            continue
+        seen.add(key)
+        results.append((prob, moves))
+        if len(results) >= k:
+            break
+    return results, info
+
+def get_top_k_pairs(model, dice_tokens, idx_to_move, move_to_idx, device, k=10, game_history=[], legal_fn=None):
     """
     Get top-k move pairs with joint probabilities for non-doubles.
+    Finished turns only: a one-checker answer is kept when the other die cannot be played.
     """
-    model.eval()
-    
-    # Build full context: game history + dice tokens
-    input_tokens = game_history + dice_tokens
-    context_indices = [move_to_idx[token] for token in input_tokens if token in move_to_idx]
-    
-    # Handle truncation if needed
-    if len(context_indices) > model.block_size:
-        context_indices = context_indices[-model.block_size:]
-        
-    context_tensor = torch.tensor([context_indices], dtype=torch.long).to(device)
-    
-    pairs = []
-    
-    with torch.no_grad():
-        # Step 1: Get probability distribution for first move
-        output, _ = model(context_tensor)
-        first_logits = output[0, -1]  # Last position
-        first_probs = torch.softmax(first_logits, dim=-1)
-        
-        # Get top candidates for first move
-        # Look deeper to find enough valid move combinations
-        top_first_k = min(50, len(first_probs))
-        first_indices = torch.argsort(first_probs, descending=True)[:top_first_k]
-        
-        # Step 2: For each first move candidate, get second move probabilities
-        for first_idx in first_indices:
-            first_token = idx_to_move.get(first_idx.item(), None)
-            
-            # Check if it's a move token or NOMOVE
-            if not first_token:
-                continue
-            
-            # Allow NOMOVE
-            if first_token == '<NOMOVE>':
-                 first_prob = first_probs[first_idx].item()
-                 pairs.append((first_prob, ['<NOMOVE>']))
-                 continue
-                 
-            if not first_token.startswith('m_'):
-                continue
-            
-            first_prob = first_probs[first_idx].item()
-            
-            # Extend context with first move
-            # Be careful with block size here too
-            extended_context = context_indices + [first_idx.item()]
-            if len(extended_context) > model.block_size:
-                extended_context = extended_context[-model.block_size:]
-                
-            extended_tensor = torch.tensor([extended_context], dtype=torch.long).to(device)
-            
-            # Get second move probabilities
-            output2, _ = model(extended_tensor)
-            second_logits = output2[0, -1]
-            second_probs = torch.softmax(second_logits, dim=-1)
-            
-            # Get top candidates for second move
-            top_second_k = min(10, len(second_probs))
-            second_indices = torch.argsort(second_probs, descending=True)[:top_second_k]
-            
-            # Step 3: Compute joint probabilities
-            for second_idx in second_indices:
-                second_token = idx_to_move.get(second_idx.item(), None)
-                if not second_token:
-                    continue
-                    
-                # We expect a move or EOM
-                if second_token == '<EOM>':
-                    # Partial move sequence (1 move only)
-                    second_prob = second_probs[second_idx].item()
-                    joint_prob = first_prob * second_prob
-                    pairs.append((joint_prob, [first_token]))
-                    continue
-                    
-                if not second_token.startswith('m_'):
-                    continue
-                
-                second_prob = second_probs[second_idx].item()
-                
-                # Joint probability: P(m1, m2) = P(m1) * P(m2 | m1)
-                joint_prob = first_prob * second_prob
-                
-                pairs.append((joint_prob, [first_token, second_token]))
-    
-    # Step 4: Sort by joint probability and return top-k
-    pairs.sort(key=lambda x: x[0], reverse=True)
-    
-    # Filter out partial moves that didn't end with EOM
-    # Actually, for 2-move sequences, we might accept partial if probability is high enough
-    # But ideally we want completed thoughts.
-    return pairs[:k]
+    results, _info = get_top_k_sequences(
+        model, dice_tokens, idx_to_move, move_to_idx, device,
+        k=k, game_history=game_history, max_moves=2, legal_fn=legal_fn,
+    )
+    return results
 
-def get_top_k_quadruples(model, dice_tokens, idx_to_move, move_to_idx, device, k=10, game_history=[]):
+def get_top_k_quadruples(model, dice_tokens, idx_to_move, move_to_idx, device, k=10, game_history=[], legal_fn=None):
     """
     Get top-k move quadruples with joint probabilities for doubles.
     Uses beam search to efficiently explore 4-move sequences.
-    
+
     Handles:
     - <NOMOVE>: Returns immediately if predicted
     - <EOM>: Stops sequence generation early (e.g. for partial turns)
     - Max 4 moves: Stops after 4 moves
+    A stop before 4 moves is returned only when no checker can still be played.
     """
-    model.eval()
-    
-    # Build full context
-    input_tokens = game_history + dice_tokens
-    context_indices = [move_to_idx[token] for token in input_tokens if token in move_to_idx]
-    
-    if len(context_indices) > model.block_size:
-        context_indices = context_indices[-model.block_size:]
-        
-    # Beam search: keep top-k sequences at each step
-    # Increase beam width to avoid pruning valid but lower prob partial sequences early
-    beam_width = k * 3
-    
-    # (context, prob, moves_list, finished)
-    # finished=True means we hit <EOM> or <NOMOVE> or max length
-    sequences = [(context_indices, 1.0, [], False)] 
-    
-    with torch.no_grad():
-        # Doubles can have up to 4 moves
-        for step in range(4): 
-            candidates = []
-            active_sequences = [s for s in sequences if not s[3]] # Only extend unfinished
-            finished_sequences = [s for s in sequences if s[3]]   # Keep finished ones
-            
-            if not active_sequences:
-                break
-                
-            for context, prob, moves, _ in active_sequences:
-                # Truncate context if needed
-                if len(context) > model.block_size:
-                    ctx_input = context[-model.block_size:]
-                else:
-                    ctx_input = context
-                    
-                context_tensor = torch.tensor([ctx_input], dtype=torch.long).to(device)
-                output, _ = model(context_tensor)
-                logits = output[0, -1]
-                probs = torch.softmax(logits, dim=-1)
-                
-                # Get top candidates for this step
-                top_k_step = min(20, len(probs)) 
-                top_indices = torch.argsort(probs, descending=True)[:top_k_step]
-                
-                for idx in top_indices:
-                    token = idx_to_move.get(idx.item(), None)
-                    if not token:
-                        continue
-                    
-                    step_prob = probs[idx].item()
-                    joint_prob = prob * step_prob
-                    
-                    # Handle termination conditions
-                    if token == '<NOMOVE>':
-                        if len(moves) == 0:
-                            # Valid "No Move" prediction - mark as finished
-                            candidates.append((context + [idx.item()], joint_prob, ['<NOMOVE>'], True))
-                        continue
-                        
-                    if token == '<EOM>':
-                         # Valid partial sequence end - mark as finished
-                         # Don't include <EOM> in the moves list for the game engine, but stop generation
-                         candidates.append((context + [idx.item()], joint_prob, moves, True))
-                         continue
-                         
-                    if not token.startswith('m_'):
-                        continue
-                    
-                    new_context = context + [idx.item()]
-                    new_moves = moves + [token]
-                    
-                    # If we've reached 4 moves, this sequence is now finished
-                    is_finished = (len(new_moves) == 4)
-                    candidates.append((new_context, joint_prob, new_moves, is_finished))
-            
-            # Combine newly extended candidates with previously finished sequences
-            all_pool = finished_sequences + candidates
-            
-            # Sort by probability and keep top beam_width
-            all_pool.sort(key=lambda x: x[1], reverse=True)
-            sequences = all_pool[:beam_width]
-            
-            # If all remaining sequences are finished, we can stop early
-            if all(s[3] for s in sequences):
-                break
-
-    # Sort final results
-    sequences.sort(key=lambda x: x[1], reverse=True)
-    
-    # Convert to expected return format (prob, moves)
-    # Filter out empty moves unless it's explicitly NOMOVE
-    results = []
-    for _, prob, moves, _ in sequences:
-        if moves: # Ensure we don't return empty lists
-             results.append((prob, moves))
-             
-    return results[:k]
+    results, _info = get_top_k_sequences(
+        model, dice_tokens, idx_to_move, move_to_idx, device,
+        k=k, game_history=game_history, max_moves=4, legal_fn=legal_fn,
+    )
+    return results
 
 class BackgammonMovePredictor:
     """
@@ -746,8 +716,7 @@ class BackgammonMovePredictor:
             if not ids:
                 continue
             # Keep <STARTGAME> <U> and the newest tokens when the game is longer than the block.
-            if len(ids) > block:
-                ids = ids[:2] + ids[-(block - 2):]
+            ids = _fit_block(ids, block)
             idx = torch.tensor([ids], dtype=torch.long, device=self.device)
             probs = self.model.predict_value(idx)
             if probs is None:
@@ -758,7 +727,7 @@ class BackgammonMovePredictor:
             scores[tuple(seq)] = score
         return scores
 
-    def predict_moves(self, game_history, dice, top_k=5):
+    def predict_moves(self, game_history, dice, top_k=5, legal_fn=None):
         """
         Predict moves with automatic device handling.
         Returns atomic move sequences.
@@ -767,6 +736,8 @@ class BackgammonMovePredictor:
             game_history: List of token strings
             dice: Dice roll string (e.g., "52")
             top_k: Number of predictions to return
+            legal_fn: optional legal_fn(moves_so_far) -> tokens that are legal now.
+                When set, every returned turn is finished and legal.
 
         Returns:
             List of (confidence, move_sequence_list) tuples
@@ -774,21 +745,27 @@ class BackgammonMovePredictor:
         if not self.model:
             raise ValueError("Model not loaded")
 
-        return predict_backgammon_moves(
+        meta = {}
+        sequences = predict_backgammon_moves(
             self.model, game_history, dice,
             self.idx_to_move, self.move_to_idx,
-            self.device, top_k=top_k
+            self.device, top_k=top_k, legal_fn=legal_fn, meta=meta,
         )
+        # Unmasked top token, before the legal mask, so play can report a bad first choice.
+        self.last_unmasked_first = meta.get('unmasked_first')
+        self.last_unmasked_order = meta.get('unmasked_order') or []
+        return sequences
 
 # Updated predict function to use atomic tokenization logic
-def predict_backgammon_moves(model, game_history, dice_roll, idx_to_move, move_to_idx, device, top_k=5):
+def predict_backgammon_moves(model, game_history, dice_roll, idx_to_move, move_to_idx, device, top_k=5, legal_fn=None, meta=None):
     """
     Generate top-k move sequence predictions (pairs or quadruples).
-    
+
     Returns:
-        List of (joint_prob, move_sequence) tuples, sorted by probability
+        List of (joint_prob, move_sequence) tuples, sorted by probability.
+        With legal_fn, each sequence is a finished legal turn.
     """
-    
+
     # Clean dice roll format if needed (e.g., d52 -> 52)
     if dice_roll.startswith('d') and len(dice_roll) > 2:
         clean_dice = dice_roll[1:]
@@ -797,22 +774,15 @@ def predict_backgammon_moves(model, game_history, dice_roll, idx_to_move, move_t
 
     # Split dice into atomic tokens
     dice_tokens = split_dice(clean_dice)  # "66" -> ["d6", "d6"]
-    
-    # Determine if doubles
-    is_double = is_doubles(clean_dice)
-    
-    # Get predictions based on dice type
-    if is_double:
-        # Doubles: need up to 4 moves
-        sequences = get_top_k_quadruples(
-            model, dice_tokens, idx_to_move, move_to_idx, device, k=top_k, game_history=game_history
-        )
-    else:
-        # Non-doubles: need up to 2 moves
-        sequences = get_top_k_pairs(
-            model, dice_tokens, idx_to_move, move_to_idx, device, k=top_k, game_history=game_history
-        )
-    
+
+    # Doubles can use four checkers. Any other roll uses two.
+    max_moves = 4 if is_doubles(clean_dice) else 2
+    sequences, info = get_top_k_sequences(
+        model, dice_tokens, idx_to_move, move_to_idx, device,
+        k=top_k, game_history=game_history, max_moves=max_moves, legal_fn=legal_fn,
+    )
+    if meta is not None:
+        meta.update(info)
     return sequences
 
 
