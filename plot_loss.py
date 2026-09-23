@@ -3,8 +3,8 @@
 Plot training loss from checkpoint filenames in a folder (Backgammon checkpoints).
 
 Usage:
-  python plot_loss_Nov_9_25.py <checkpoint_folder>
-  python plot_loss_Nov_9_25.py   # interactive folder selection (tkinter)
+  python plot_loss.py <checkpoint_folder>
+  python plot_loss.py   # interactive folder selection (tkinter)
 """
 
 import os

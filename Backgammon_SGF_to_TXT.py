@@ -10,7 +10,9 @@ This program:
 3. Converts moves to a text format suitable for LLM training
 4. Outputs a single .txt file with all games
 
-Format: <STARTGAME> d6 d1 m_ab m_cd <EOM> ... <EOFG>
+Format: <STARTGAME> <W|B> <1W|1B> d6 d1 m_ab m_cd <EOM> ... <EOFG>
+<W> or <B> is who won (gnubg RE). <1W> or <1B> is who moved first.
+Games with no RE stay unlabeled: <STARTGAME> moves <EOFG>.
 """
 
 import os
@@ -139,7 +141,10 @@ def process_sgf_file(file_path):
         file_path: Path to the SGF file
 
     Returns:
-        Formatted game string: "<STARTGAME> d3 d2 m_ad m_ln <EOM> ... <EOFG>"
+        Formatted game string.
+        With a result: "<STARTGAME> <W> <1B> d3 d2 m_ad m_ln <EOM> ... <EOFG>"
+        <W>/<B> is the gnubg winner. <1W>/<1B> is who moved first (training weights only).
+        No RE in the file: "<STARTGAME> d3 d2 ... <EOFG>" (unlabeled, no value target).
     """
     try:
         with open(file_path, 'r', encoding='utf-8') as file:
@@ -152,8 +157,17 @@ def process_sgf_file(file_path):
             # print(f"Warning: No tokens found in {file_path}")
             return None
 
-        # Format as space-separated tokens with game boundaries
-        game_text = '<STARTGAME> ' + ' '.join(tokens) + ' <EOFG>'
+        # RE[W+1] / RE[B+2] — the color letter matches ;W and ;B in the same file.
+        winner_match = re.search(r'RE\[([WB])', content)
+        first_match = re.search(r';([BW])\[', content)
+        header = ['<STARTGAME>']
+        if winner_match:
+            header.append(f'<{winner_match.group(1)}>')
+            # First mover is recorded so the trainer can down-weight the loser's turns.
+            # <1W>/<1B> is not a model token; the trainer strips it while tokenizing.
+            if first_match:
+                header.append(f'<1{first_match.group(1)}>')
+        game_text = ' '.join(header + tokens) + ' <EOFG>'
 
         return game_text
 

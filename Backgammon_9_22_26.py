@@ -62,18 +62,19 @@ import time
 import copy
 import sys
 import os
+import math
 
 # === LLM INTEGRATION SETUP ===
 # Use standalone predictor for inference - handles device mapping automatically
 # This allows the game to use AI-powered move prediction without complex GPU setup
 try:
-    from BackgammonMovePredictor_Standalone_Atom import BackgammonMovePredictor
+    from Backgammon_Inference import BackgammonMovePredictor
     LLM_AVAILABLE = True
     print("✅ Standalone LLM predictor available for enhanced gameplay (Atomic Tokenization)")
     print("   (Handles device mapping automatically - works on any hardware)")
 except ImportError:
-    print("⚠️  Warning: Could not import BackgammonMovePredictor_Standalone_Atom.")
-    print("   Make sure BackgammonMovePredictor_Standalone_Atom.py is in the same directory.")
+    print("⚠️  Warning: Could not import Backgammon_Inference.")
+    print("   Make sure Backgammon_Inference.py is in the same directory.")
     LLM_AVAILABLE = False
     BackgammonMovePredictor = None
 
@@ -174,6 +175,19 @@ black_pieces_off = 0
 
 # Track LLM failures for game statistics
 llm_failures = 0
+
+# Same counters as Chess: was the model's own 1st choice legal, and did the win-guesser skip it?
+# player 1 is White (<W>), player -1 is Black (<B>). opening_player is who won the opening roll.
+VALUE_RERANK_LAMBDA = 1.0
+opening_player = None
+llm_stats = {
+    'total_moves': 0,
+    'first_legal': 0,
+    'second_legal': 0,
+    'third_plus_legal': 0,
+    'no_legal': 0,
+    'value_overrides': 0,
+}
 
 def display_initial_rolls(player_die, ai_die):
     """Display the initial die rolls to determine who goes first"""
@@ -537,10 +551,12 @@ def perform_search_ai_with_move_capture(dice, moves_left_ai, player):
 def llm_ai_move(dice, moves_left_ai, game_history_tokens, player):
     """
     === LLM AI MOVE EXECUTION ===
-    Get move recommendations from LLM and execute the first legal one.
+    Get move recommendations from the LLM.
+    If choice 1 is illegal, print that (the model is not matching the board).
+    Among legal choices, a later one can be played when the win-guesser likes it better.
     Updated for Atomic Tokenization.
     """
-    global llm_predictor, ai_type
+    global llm_predictor, ai_type, llm_stats, llm_failures, opening_player
 
     # === AVAILABILITY CHECK ===
     if not llm_predictor or ai_type != "LLM_AI":
@@ -564,21 +580,32 @@ def llm_ai_move(dice, moves_left_ai, game_history_tokens, player):
         #    (0.85, ['m_ab', 'm_cd']),  # Sequence 1: Move a->b, then c->d (Confidence 85%)
         #    (0.10, ['m_ef', 'm_gh']),  # Sequence 2: Move e->f, then g->h (Confidence 10%)
         # ]
-        # We try Sequence 1 first. If it's valid on the board, we use it.
-        # If not, we try Sequence 2, and so on.
-        all_sequences = llm_predictor.predict_moves(game_history, dice_token, top_k=5)
+        # We try Sequence 1 first. If it is not legal, that is reported — it means the
+        # model is not matching the board. A later legal sequence can still be played,
+        # and if the checkpoint has a win-guesser it may prefer that later sequence.
+        # Player 1 is White (<W>), player -1 is Black (<B>), same letters as gnubg.
+        side = 'W' if player == 1 else 'B'
+        history_for_model = game_history
+        if hasattr(llm_predictor, 'with_result_token'):
+            history_for_model = llm_predictor.with_result_token(game_history, f'<{side}>')
+        all_sequences = llm_predictor.predict_moves(history_for_model, dice_token, top_k=5)
 
         print(f"🤖 LLM_AI RAW RESPONSES: {len(all_sequences)} sequences")
         
         for i, (confidence, sequence) in enumerate(all_sequences, 1):
             print(f"  {i}. {sequence} (confidence: {confidence:.4f})")
 
-        # Iterate through candidate sequences and find the first valid one
-        for confidence, sequence in all_sequences:
+        # legal_found keeps policy order. Rank 1 is the model's own first choice.
+        legal_found = []
+        for rank, (confidence, sequence) in enumerate(all_sequences, 1):
             print(f"🔍 Checking sequence: {sequence}")
+            reject_reason = None
             
             # Validate sequence
             if not sequence:
+                reject_reason = "empty sequence"
+                if rank == 1:
+                    print(f"LLM 1st choice was not legal: {sequence} ({reject_reason})")
                 continue
                 
             # Check for NOMOVE special token
@@ -587,15 +614,18 @@ def llm_ai_move(dice, moves_left_ai, game_history_tokens, player):
                 # Verify we really have no moves
                 if not has_valid_moves(player, dice):
                      print("✅ Verified: No moves possible")
-                     return ('<NOMOVE>', 0)
+                     legal_found.append({
+                         'rank': rank, 'confidence': confidence, 'sequence': sequence,
+                         'moves': None, 'nomove': True,
+                     })
                 else:
                      print("❌ Invalid <NOMOVE> suggestion - moves are possible")
-                     continue
+                     reject_reason = "NOMOVE but legal moves exist"
+                     if rank == 1:
+                         print(f"LLM 1st choice was not legal: {sequence} ({reject_reason})")
+                continue
             
-            # Simulate and Execute
-            # We need to simulate the sequence to see if it's valid
-            # If valid, we execute it
-            
+            # Simulate the sequence. Execution happens after every candidate is scored.
             import copy
             test_board = copy.deepcopy(board)
             test_bar = copy.deepcopy(bar)
@@ -614,6 +644,7 @@ def llm_ai_move(dice, moves_left_ai, game_history_tokens, player):
                  
                  if start is None or end is None:
                      valid_sequence = False
+                     reject_reason = f"could not parse {move_token}"
                      print(f"   ❌ Could not parse or illegal move: {move_token}")
                      break
                  
@@ -625,6 +656,7 @@ def llm_ai_move(dice, moves_left_ai, game_history_tokens, player):
                  # Fix: We need to call is_valid_move with test_board
                  if not is_valid_move(start, end, test_dice, player, test_board, test_bar):
                      valid_sequence = False
+                     reject_reason = f"illegal on the board: {move_token}"
                      print(f"   ❌ Illegal move on simulated board: {move_token}")
                      break
                      
@@ -666,6 +698,7 @@ def llm_ai_move(dice, moves_left_ai, game_history_tokens, player):
                  
                  if not dice_used:
                      valid_sequence = False
+                     reject_reason = f"no matching die for {move_token}"
                      print(f"   ❌ No matching die for move: {move_token}")
                      break
             
@@ -680,26 +713,81 @@ def llm_ai_move(dice, moves_left_ai, game_history_tokens, player):
                     # If valid moves remain, the LLM sequence is incomplete!
                     # REJECT IT to force fallback to Search AI for a full turn
                     valid_sequence = False
+                    reject_reason = f"turn incomplete, moves remain with dice {remaining_dice}"
                     print(f"   ❌ Sequence incomplete - valid moves remain with dice {remaining_dice}")
                     # Note: We set valid_sequence=False so the loop continues to the next candidate
                     # If all candidates are incomplete, the loop finishes with valid_sequence=False
                     # and the function returns None, triggering full search AI fallback.
 
             if valid_sequence and moves_to_make:
-                print(f"✅ Sequence accepted! Executing {len(moves_to_make)} moves.")
-                moves_executed = 0
-                for i, (start, end, tok) in enumerate(moves_to_make, 1):
-                    print(f"🎯 Executing move {i}: {tok}")
-                    make_move(start, end, player, moves_left_ai - i + 1, confidence)
-                    moves_executed += 1
-                
-                return (sequence, moves_executed)
+                legal_found.append({
+                    'rank': rank, 'confidence': confidence, 'sequence': sequence,
+                    'moves': list(moves_to_make), 'nomove': False,
+                })
+            elif rank == 1:
+                # The signal that the model is not working: its own first choice was illegal.
+                print(f"LLM 1st choice was not legal: {sequence} ({reject_reason or 'rejected'})")
 
-        # Fallback to search AI if no LLM moves work
-        print("🔄 All LLM_AI predictions failed - falling back to search_AI for ENTIRE turn")
-        global llm_failures
-        llm_failures += 1
-        return None
+        if not legal_found:
+            llm_stats['total_moves'] += 1
+            llm_stats['no_legal'] += 1
+            # Fallback to search AI if no LLM moves work
+            print("🔄 All LLM_AI predictions failed - falling back to search_AI for ENTIRE turn")
+            llm_failures += 1
+            return None
+
+        chosen = legal_found[0]
+        # Win-guesser: among LEGAL turns only, a later one can replace the first legal pick.
+        # Checkpoints without a value head return {} and we keep today's first-legal behavior.
+        if (VALUE_RERANK_LAMBDA > 0 and len(legal_found) > 1
+                and hasattr(llm_predictor, 'rerank_by_value')):
+            try:
+                values = llm_predictor.rerank_by_value(
+                    history_for_model, dice_token, side,
+                    [(c['confidence'], c['sequence']) for c in legal_found],
+                )
+                if values:
+                    def _win_score(cand):
+                        return (math.log(max(cand['confidence'], 1e-9))
+                                + VALUE_RERANK_LAMBDA * values.get(tuple(cand['sequence']), 0.0))
+                    ranked = sorted(legal_found, key=_win_score, reverse=True)
+                    if tuple(ranked[0]['sequence']) != tuple(chosen['sequence']):
+                        llm_stats['value_overrides'] += 1
+                        orig_place = next(i + 1 for i, c in enumerate(legal_found) if c is ranked[0])
+                        place_word = {1: "1st", 2: "2nd", 3: "3rd"}.get(orig_place, f"{orig_place}th")
+                        first_moves = ' '.join(chosen['sequence'])
+                        picked_moves = ' '.join(ranked[0]['sequence'])
+                        first_went_first = "moved first" if opening_player == player else "moved second"
+                        print(f"Not using the LLM's 1st legal pick ({first_moves}). "
+                              f"Playing its {place_word} legal pick ({picked_moves}) instead — "
+                              f"win-guesser liked it better for winning "
+                              f"(1st win-score={values.get(tuple(chosen['sequence']), 0.0):+.2f}, "
+                              f"picked win-score={values.get(tuple(ranked[0]['sequence']), 0.0):+.2f}, "
+                              f"side={side} {first_went_first}).")
+                    chosen = ranked[0]
+            except Exception as rerank_error:
+                print(f"Value re-rank skipped ({type(rerank_error).__name__}: {rerank_error})")
+
+        # first_legal means the model's own 1st choice was legal, even if the win-guesser played another.
+        first_legal_rank = legal_found[0]['rank']
+        llm_stats['total_moves'] += 1
+        if first_legal_rank == 1:
+            llm_stats['first_legal'] += 1
+        elif first_legal_rank == 2:
+            llm_stats['second_legal'] += 1
+        else:
+            llm_stats['third_plus_legal'] += 1
+
+        if chosen['nomove']:
+            return ('<NOMOVE>', 0)
+
+        print(f"✅ Sequence accepted! Executing {len(chosen['moves'])} moves.")
+        moves_executed = 0
+        for i, (start, end, tok) in enumerate(chosen['moves'], 1):
+            print(f"🎯 Executing move {i}: {tok}")
+            make_move(start, end, player, moves_left_ai - i + 1, chosen['confidence'])
+            moves_executed += 1
+        return (chosen['sequence'], moves_executed)
 
     except Exception as e:
         print(f"❌ LLM prediction failed: {e}")
@@ -1394,6 +1482,21 @@ def display_winner(winner):
 
     screen.blit(text, (10, HEIGHT + 80))
     screen.blit(restart_text, (10, HEIGHT + 130))
+    # One line so a weak checkpoint is visible without reading the terminal.
+    if llm_stats['total_moves'] > 0:
+        stats_font = pygame.font.Font(None, 22)
+        stats_line = (
+            f"1st choice legal {llm_stats['first_legal']}/{llm_stats['total_moves']}"
+            f"  |  win-guesser overrode {llm_stats['value_overrides']}"
+        )
+        screen.blit(stats_font.render(stats_line, True, BLACK), (10, HEIGHT + 160))
+        print("\n=== LLM Move Statistics ===")
+        print(f"Total LLM moves: {llm_stats['total_moves']}")
+        print(f"First response legal: {llm_stats['first_legal']} times")
+        print(f"Second response legal: {llm_stats['second_legal']} times")
+        print(f"Third+ response legal: {llm_stats['third_plus_legal']} times")
+        print(f"No legal moves found: {llm_stats['no_legal']} times")
+        print(f"Win-guesser overrode 1st pick: {llm_stats['value_overrides']} times")
     pygame.display.flip()
     # Don't wait - let user choose restart or quit
 
@@ -1616,10 +1719,13 @@ elif ai_initial_die > player_initial_die:
     print(f"Player rolled {player_initial_die}, AI rolled {ai_initial_die} - AI goes first!")
     print(f"First turn dice: {dice1}, {dice2}")
 
-# Track the initial roll for LLM context
-initial_dice_token = f"d{dice1}{dice2}"  # Format: d53 for dice 5,3
-game_history_tokens.append(initial_dice_token)
-print(f"📝 Added initial dice token to history: {initial_dice_token}")
+# Who moved first. The win-guesser report uses this; player 1 is White, player -1 is Black.
+opening_player = player_turn
+
+# Track the initial roll for LLM context.
+# Atomic tokens, same as later turns and the trainer: d5 d3, not the combined d53.
+game_history_tokens.extend([f"d{dice1}", f"d{dice2}"])
+print(f"📝 Added initial dice tokens to history: d{dice1} d{dice2}")
 
 initial_roll_done = True
 dice_rolled = True  # Set dice as rolled so the game can proceed
@@ -1972,6 +2078,13 @@ while running:
                         white_pieces_off = 0
                         black_pieces_off = 0
                         llm_failures = 0  # Reset LLM failure counter
+                        llm_stats['total_moves'] = 0
+                        llm_stats['first_legal'] = 0
+                        llm_stats['second_legal'] = 0
+                        llm_stats['third_plus_legal'] = 0
+                        llm_stats['no_legal'] = 0
+                        llm_stats['value_overrides'] = 0
+                        opening_player = 1  # Restart does not re-roll; player 1 (White) moves first
                         # Standard backgammon starting positions (position = label)
                         # Blue pieces: start at 24, move counter-clockwise (24→1), bear off to 0
                         # Red pieces: start at 1, move clockwise (1→24), bear off to 25

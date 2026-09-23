@@ -35,7 +35,20 @@ USAGE WORKFLOW:
 3. Play: LLM provides strategic suggestions, search AI ensures legality
 """
 
+import re
 import os
+import random   # <U> result masking in BackgammonMovesDataset
+
+# PyTorch 2.9+ on this GB10 ignores PYTORCH_CUDA_ALLOC_CONF. The new name must be
+# set before torch is imported or the allocator never sees it (fragmented unified memory).
+if not os.environ.get('PYTORCH_ALLOC_CONF'):
+    os.environ['PYTORCH_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segments:True,garbage_collection_threshold:0.8'
+# Same as Chess: Triton's own ptxas does not know this Spark's sm_121a, so torch.compile
+# needs the system CUDA assembler before torch is imported.
+if not os.environ.get('TRITON_PTXAS_PATH'):
+    _cuda13_ptxas = '/usr/local/cuda/bin/ptxas'
+    if os.path.isfile(_cuda13_ptxas):
+        os.environ['TRITON_PTXAS_PATH'] = _cuda13_ptxas
 
 # PLAIN LANGUAGE: Debug switches for inference (safe to delete later)
 # - DEBUG_PREDICTIONS: turn on/off one-shot debug prints during prediction
@@ -61,6 +74,30 @@ from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from transformers.optimization import Adafactor
 
+def _uses_unified_memory():
+    """True when CUDA memory is the same RAM the desktop uses (NVIDIA GB10 / DGX Spark)."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        if 'GB10' in torch.cuda.get_device_name(0).upper():
+            return True
+        gpu = float(torch.cuda.get_device_properties(0).total_memory)
+        sys_ram = float(os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES'))
+        return abs(gpu - sys_ram) / max(sys_ram, 1.0) < 0.15
+    except Exception:
+        return False
+
+
+# Leave this much RAM free on the Spark. A fixed 80% of the whole 128 GB pool freezes the desktop.
+UNIFIED_HEADROOM_BYTES = 16 * (1024 ** 3)
+
+
+def _unified_cuda_fraction(free, total):
+    """CUDA cap = memory that is free now, minus headroom for the desktop."""
+    usable = max(UNIFIED_HEADROOM_BYTES, free - UNIFIED_HEADROOM_BYTES)
+    return max(0.15, min(0.70, usable / max(total, 1)))
+
+
 # Prioritize MPS on Mac systems for native GPU support
 if platform.system() == "Darwin" and torch.backends.mps.is_available():
     device = torch.device('mps')
@@ -71,7 +108,7 @@ elif torch.cuda.is_available():
     # For now, just initialize to None and set device
     gpu_indices = None
 
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segments:True,garbage_collection_threshold:0.8'
+    # PYTORCH_ALLOC_CONF is set above, before torch is imported.
 
     # Train faster by allowing TF32 precision on A100 and newer GPUs if available
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -93,8 +130,16 @@ elif torch.cuda.is_available():
     print("Using CUDA with optimized settings")
     # Set CUDA to release memory when possible - helps prevent OOM errors
     torch.cuda.empty_cache()
-    # Conservative memory allocation to prevent crashes with VNC/Cinnamon
-    torch.cuda.set_per_process_memory_fraction(0.80)
+    # Discrete GPUs can take 80% of VRAM. On the Spark, CUDA and the desktop share one pool,
+    # so the cap is "what is free now, minus 16 GB", the same rule as Chess.
+    if _uses_unified_memory():
+        _free, _total = torch.cuda.mem_get_info(0)
+        _frac = _unified_cuda_fraction(_free, _total)
+        torch.cuda.set_per_process_memory_fraction(_frac)
+        print(f"GB10 unified memory: CUDA capped at {_frac:.0%} of RAM "
+              f"(keeps {UNIFIED_HEADROOM_BYTES/2**30:.0f} GB free for the desktop)")
+    else:
+        torch.cuda.set_per_process_memory_fraction(0.80)
 else:
     print("❌ ERROR: No GPU available. This backgammon training requires GPU support (CUDA or MPS).")
     exit(1)
@@ -120,6 +165,10 @@ BACKGAMMON_DEFAULTS = {
     'learning_rate': 4e-4,  # stable LR for this size
     'weight_decay': 0.01,   # standard
     'max_norm': 5.0,     # gradient clipping
+    # Same idea as Chess (Sep 2026): loser moves count less, and a small head guesses who won.
+    'loser_move_weight': 0.5,  # weight on checker moves (m_*) played by the side that lost
+    'value_loss_weight': 0.2,  # weight of the auxiliary White/Black win head
+    'value_mask_prob': 0.5,    # fraction of games whose input result token is replaced by <U>
 }
 
 # Core model components for backgammon move prediction
@@ -646,13 +695,18 @@ class BackgammonModel(nn.Module):
         dropout: Dropout probability for regularization
         use_chess: Enable backgammon-specific masking (always True for BackgammonModel)
         use_dna: Enable DNA-specific features (always False for BackgammonModel)
+        use_value_head: Extra 2-way head predicting who won (White / Black) from the moves so far
     """
-    def __init__(self, vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=False, use_dna=False):
+    def __init__(self, vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=False, use_dna=False, use_value_head=False):
         super().__init__()
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.use_chess = use_chess  # Using chess variable name for backgammon masking
         self.use_dna = use_dna
+        self.use_value_head = use_value_head
+        self.loser_move_weight = BACKGAMMON_DEFAULTS['loser_move_weight']
+        self.value_loss_weight = BACKGAMMON_DEFAULTS['value_loss_weight']
+        self.special_ids = {}
         if use_chess:
             self.start_game_token = None  # Will be set after vocab creation
 
@@ -675,8 +729,22 @@ class BackgammonModel(nn.Module):
         self.rms_final = RMSNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
+        # Value head (Sep 2026): 0 = White won (<W>), 1 = Black won (<B>).
+        # Trained only on games whose input result token was masked to <U>, so it cannot cheat.
+        if self.use_value_head:
+            self.head_value = nn.Linear(n_embd, 2)
+
         # Initialize weights
         self.apply(self._init_weights)
+
+    def set_special_ids(self, move_to_idx):
+        """Remember ids the loss and the value head need. Safe to call again after the vocab grows."""
+        self.special_ids = {}
+        for name in ('<STARTGAME>', '<EOFG>', '<EOM>', '<PAD>', '<W>', '<B>', '<U>'):
+            if name in move_to_idx:
+                self.special_ids[name] = move_to_idx[name]
+        if '<STARTGAME>' in move_to_idx:
+            self.start_game_token = move_to_idx['<STARTGAME>']
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -695,20 +763,62 @@ class BackgammonModel(nn.Module):
         mask = (game_boundaries.unsqueeze(1) == game_boundaries.unsqueeze(2)).float()
         return mask
 
-    def forward(self, idx, targets=None):
+    def _backbone(self, idx):
+        """Embeddings + transformer blocks + final norm. Returns hidden states [B, T, n_embd]."""
         B, T = idx.shape
-
-        # Get embeddings
         tok_emb = self.token_embedding_table(idx)
         pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device))
         x = tok_emb + pos_emb
-
-        # Apply transformer blocks with backgammon game mask
         for block in self.blocks:
             x = block(x, mask=self.create_game_mask(idx))
+        return self.rms_final(x)
 
-        # Final normalization and prediction
-        x = self.rms_final(x)
+    def game_start_index(self, idx):
+        """For every position t, index of the most recent <STARTGAME> at or before t. Shape [B, T]."""
+        B, T = idx.shape
+        t = torch.arange(T, device=idx.device).unsqueeze(0).expand(B, T)
+        is_start = (idx == self.start_game_token)
+        start_idx = torch.where(is_start, t, torch.zeros_like(t)).cummax(dim=1).values
+        return start_idx
+
+    def _value_loss(self, h, idx, targets):
+        """Cross-entropy of the win head. Only games whose input result token is <U>.
+        The true winner is the target at <STARTGAME> (y still has <W> or <B> after <U> masking).
+        """
+        if not self.use_value_head:
+            return None
+        sp = self.special_ids
+        if '<U>' not in sp or '<W>' not in sp or '<B>' not in sp or self.start_game_token is None:
+            return None
+        B, T, _ = h.shape
+        start_idx = self.game_start_index(idx)
+        true_result = targets.gather(1, start_idx)
+        input_result = idx.gather(1, (start_idx + 1).clamp(max=T - 1))
+        q = torch.arange(T, device=idx.device).unsqueeze(0) + 1 - start_idx
+        value_tgt = torch.full_like(true_result, -1)
+        value_tgt = torch.where(true_result == sp['<W>'], torch.zeros_like(value_tgt), value_tgt)
+        value_tgt = torch.where(true_result == sp['<B>'], torch.ones_like(value_tgt), value_tgt)
+        pad_id = sp.get('<PAD>')
+        not_pad = torch.ones_like(targets, dtype=torch.bool) if pad_id is None else (targets != pad_id)
+        value_mask = (input_result == sp['<U>']) & (value_tgt >= 0) & (q >= 2) & not_pad
+        if not value_mask.any():
+            return None
+        logits = self.head_value(h[value_mask])
+        return F.cross_entropy(logits, value_tgt[value_mask])
+
+    @torch.no_grad()
+    def predict_value(self, idx):
+        """Softmax over (White won, Black won) at the last position. Prompt should start <STARTGAME> <U>."""
+        if not self.use_value_head:
+            return None
+        h = self._backbone(idx)
+        return F.softmax(self.head_value(h[:, -1]), dim=-1)
+
+    def forward(self, idx, targets=None, token_weights=None):
+        B, T = idx.shape
+
+        # Hidden states are shared by the move head and the win head
+        x = self._backbone(idx)
         logits = self.lm_head(x)
 
         # Calculate loss if training
@@ -716,28 +826,36 @@ class BackgammonModel(nn.Module):
             loss = None
             return logits, loss
         else:
-            B, T, C = logits.shape
-            logits_flat = logits.view(B*T, C)
+            logits_flat = logits.view(B*T, -1)
             targets_flat = targets.view(B*T)
+            # token_weights: 0.5 on the loser's checker moves, 1 everywhere else (from the dataset)
+            if token_weights is None:
+                token_weights = torch.ones(B, T, device=idx.device, dtype=torch.float32)
+            else:
+                token_weights = token_weights.to(device=idx.device, dtype=torch.float32)
             # Masked loss: only count move tokens if mask is available
             if hasattr(self, 'is_move_vec') and self.is_move_vec is not None:
+                per_tok = F.cross_entropy(logits_flat, targets_flat, reduction='none')
                 with torch.no_grad():
                     mask = self.is_move_vec.to(targets_flat.device)[targets_flat]
-                # Filter to only move token positions to avoid large intermediate tensors
-                move_indices = mask > 0
-                num_move_tokens = move_indices.sum().item()
-                
-                if move_indices.any():
-                    loss = F.cross_entropy(logits_flat[move_indices], targets_flat[move_indices])
+                w = mask * token_weights.reshape(-1)
+                num_move_tokens = int((mask > 0).sum().item())
+                if num_move_tokens > 0:
+                    loss = (per_tok * w).sum() / w.sum().clamp(min=1.0)
                 else:
                     loss = torch.tensor(0.0, device=logits_flat.device)
-                
-                # Return loss and number of move tokens for correct multi-GPU averaging
-                return logits, (loss, num_move_tokens)
             else:
-                loss = F.cross_entropy(logits_flat, targets_flat)
-                # For unmasked loss, all tokens count
-                return logits, (loss, B*T)
+                per_tok = F.cross_entropy(logits_flat, targets_flat, reduction='none')
+                w = token_weights.reshape(-1)
+                loss = (per_tok * w).sum() / w.sum().clamp(min=1.0)
+                num_move_tokens = B * T
+
+            loss_value = self._value_loss(x, idx, targets)
+            if loss_value is not None:
+                loss = loss + self.value_loss_weight * loss_value
+
+            # Return loss and number of move tokens for correct multi-GPU averaging
+            return logits, (loss, num_move_tokens)
 
 
 # Backgammon dataset and utility functions
@@ -781,8 +899,10 @@ class BackgammonMovesDataset(Dataset):
         self.start_game_pattern = '<STARTGAME>'
         self.eofg_pattern = '<EOFG>'
 
-        # For large datasets, use parallel processing to speed up tokenization
+        # For large datasets, use parallel processing to speed up tokenization.
+        # This step is CPU-only. nvidia-smi stays near 0% until the training loop starts.
         if len(text) > 1_000_000:  # Only parallelize for large datasets
+            print("Tokenizing games on the CPU (GPU idle until the first training batch)...")
             import multiprocessing as mp
             from concurrent.futures import ProcessPoolExecutor
 
@@ -849,6 +969,31 @@ class BackgammonMovesDataset(Dataset):
 
         print(f"Tokenized {len(self.tokens)} backgammon moves, all validated")
 
+        # Who moved first in each game, in the same order as <STARTGAME> tokens.
+        # <1W>/<1B> is written by Backgammon_SGF_to_TXT and is not a model token.
+        self._first_movers = self._scan_first_movers(text)
+        self._w_id = move_to_idx.get('<W>')
+        self._b_id = move_to_idx.get('<B>')
+        self._u_id = move_to_idx.get('<U>')
+        self._eom_id = move_to_idx.get('<EOM>')
+        self._move_token_ids = {i for t, i in move_to_idx.items() if isinstance(t, str) and t.startswith('m_')}
+        self._loser_move_weight = BACKGAMMON_DEFAULTS['loser_move_weight']
+        self._value_mask_prob = BACKGAMMON_DEFAULTS['value_mask_prob']
+
+    def _scan_first_movers(self, text):
+        """1 = White moved first, 2 = Black moved first, 0 = unlabeled game."""
+        movers = []
+        for match in re.finditer(r'<STARTGAME>', text):
+            window = text[match.end():match.end() + 48]
+            found = re.match(r'\s*(?:<W>|<B>)?\s*(<1W>|<1B>)?', window)
+            if found and found.group(1) == '<1W>':
+                movers.append(1)
+            elif found and found.group(1) == '<1B>':
+                movers.append(2)
+            else:
+                movers.append(0)
+        return movers
+
     def __len__(self):
         # Find all STARTGAME positions for sequence starts (cache this)
         if not hasattr(self, '_game_starts'):
@@ -881,7 +1026,51 @@ class BackgammonMovesDataset(Dataset):
         x[:len(x_data)] = x_data
         y[:len(y_data)] = y_data
 
-        return x, y
+        # Per-target weight. 0.5 on checker moves by the side that lost, 1 otherwise.
+        # Built from the true tokens (before <U> masking) so the winner is still known.
+        # A short game can run into the next game inside one window; each <STARTGAME> starts over.
+        token_weights = torch.ones(self.seq_length, dtype=torch.float32)
+        start_id = self.move_to_idx['<STARTGAME>']
+        i = 0
+        game_i = idx
+        while i < len(x_data):
+            if int(x_data[i]) != start_id:
+                i += 1
+                continue
+            first = self._first_movers[game_i] if game_i < len(self._first_movers) else 0
+            has_result = (i + 1 < len(x_data) and self._w_id is not None
+                          and int(x_data[i + 1]) in (self._w_id, self._b_id) and first in (1, 2))
+            if has_result:
+                winner_is_white = int(x_data[i + 1]) == self._w_id
+                side_is_white = (first == 1)  # turn 0 is whoever moved first; <EOM> flips the side
+                j = i + 2
+                while j < len(x_data) and int(x_data[j]) != start_id:
+                    tok_id = int(x_data[j])
+                    if tok_id == self._eom_id:
+                        side_is_white = not side_is_white
+                    elif tok_id in self._move_token_ids and side_is_white != winner_is_white:
+                        # y[j-1] is the target that predicts token x_data[j]
+                        token_weights[j - 1] = self._loser_move_weight
+                    j += 1
+                i = j
+            else:
+                j = i + 1
+                while j < len(x_data) and int(x_data[j]) != start_id:
+                    j += 1
+                i = j
+            game_i += 1
+
+        # Hide the result token in the INPUT of some games. y keeps the true <W> or <B>.
+        # Every game that starts inside this window is masked on its own coin flip.
+        if self._u_id is not None and self._value_mask_prob > 0 and self._w_id is not None:
+            for rel in range(len(x_data)):
+                if int(x[rel]) != start_id:
+                    continue
+                if rel + 1 < len(x_data) and int(x[rel + 1]) in (self._w_id, self._b_id):
+                    if random.random() < self._value_mask_prob:
+                        x[rel + 1] = self._u_id
+
+        return x, y, token_weights
 
 
 def process_chunk_for_backgammon_moves(args):
@@ -932,15 +1121,13 @@ def create_move_to_idx_from_text(text):
     for idx, token in enumerate(special_tokens):
         token_to_idx[token] = idx
 
-    # Extract all unique tokens from the text
+    # Unique tokens only. Do not collect every token in the file: an 8 GB games file
+    # would build a list of billions of strings and never reach the GPU.
+    print("Scanning unique tokens (CPU only — the GPU stays idle until training starts)...")
     import re
-    # Find all sequences that don't contain < > and are separated by spaces
-    tokens = re.findall(r'(?:^| )([^ <][^ ]*?)(?= |$)', text)
-
-    # Filter out empty strings and get unique tokens
     unique_tokens = set()
-    for token in tokens:
-        token = token.strip()
+    for match in re.finditer(r'[^ \n<>]+', text):
+        token = match.group()
         if token and not token.startswith('<'):
             unique_tokens.add(token)
 
@@ -973,7 +1160,25 @@ def create_move_to_idx_from_text(text):
     print(f"   - TOTAL VOCAB: {len(token_to_idx)} tokens")
     print(f"   - Learning benefit: Model understands dice-move relationships!")
 
+    # <W>, <B>, <U> go at the end so an older checkpoint's token indices stay put.
+    ensure_result_tokens(token_to_idx)
     return token_to_idx
+
+
+def ensure_result_tokens(move_to_idx):
+    """Append <W>, <B>, <U> if they are missing. Existing indices are not changed.
+
+    <W> white won, <B> black won, <U> result hidden from the model on some inputs.
+    Returns how many tokens were added.
+    """
+    added = 0
+    for tok in ('<W>', '<B>', '<U>'):
+        if tok not in move_to_idx:
+            move_to_idx[tok] = len(move_to_idx)
+            added += 1
+    if added:
+        print(f"Added result tokens <W> <B> <U> ({added} new). Older token indices unchanged.")
+    return added
 
 
 def create_idx_to_move(move_to_idx):
@@ -1018,13 +1223,18 @@ def merge_vocabularies(existing_vocab, new_text):
     # Add new tokens to vocabulary (they get indices after existing tokens)
     for token in sorted_new_tokens:
         merged_vocab[token] = len(merged_vocab)
+
+    # Result tokens are not in the game text as raw vocab items the regex keeps,
+    # so append them here too. Older checkpoints gain them without shifting indices.
+    added_results = ensure_result_tokens(merged_vocab)
     
     new_token_count = len(merged_vocab) - original_size
-    
+
     if new_token_count > 0:
         print(f"🔄 Vocabulary merge: Added {new_token_count} new tokens")
         print(f"   - Original vocab size: {original_size}")
         print(f"   - New vocab size: {len(merged_vocab)}")
+        print(f"   - Result tokens added this merge: {added_results}")
         print(f"   - All existing token indices preserved ✅")
     else:
         print(f"✅ Vocabulary merge: No new tokens found (all tokens already in vocabulary)")
@@ -1157,6 +1367,25 @@ def filter_optimizer_state(optimizer_state_dict, model):
             filtered_state['state'][param_id] = old_state
     
     return filtered_state
+
+
+def optimizer_state_matches(optimizer, optimizer_state_dict):
+    """True when the checkpoint optimizer still has one slot per model parameter.
+
+    Adding the value head changes the parameter count. PyTorch will not load an
+    optimizer state whose group size does not match, so the caller keeps a fresh
+    optimizer instead of crashing.
+    """
+    state = optimizer_state_dict[0] if isinstance(optimizer_state_dict, list) else optimizer_state_dict
+    if not isinstance(state, dict) or 'param_groups' not in state:
+        return True
+    saved = sum(len(g.get('params', [])) for g in state['param_groups'])
+    current = sum(len(g['params']) for g in optimizer.param_groups)
+    if saved != current:
+        print(f"Optimizer state skipped: checkpoint has {saved} parameters, model has {current}.")
+        print("   A new value head changes the count, so this resume uses a fresh optimizer.")
+        return False
+    return True
 
 
 def load_backgammon_file():
@@ -1312,6 +1541,7 @@ def save_model_all(model, all_text, n_embd, n_head, n_kv_heads, n_layer, dropout
             'block_size': block_size,
             'use_chess': True,  # Using chess variable for backgammon masking
             'use_dna': False,
+            'has_value_head': True,  # White/Black win head is part of this trainer
             # Training parameters (can be changed when reloading)
             'batch_size': batch_size,
             'learning_rate': learning_rate if learning_rate is not None else 3e-4,  # Current learning rate
@@ -1534,8 +1764,8 @@ def load_model_file(model_file_path=None):
             print(f"Loaded backgammon moves tokenizer with {len(move_to_idx)} tokens")
 
         # Create backgammon model
-        model = BackgammonModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout)
-        model.start_game_token = move_to_idx['<STARTGAME>']
+        model = BackgammonModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_value_head=True)
+        model.set_special_ids(move_to_idx)
         # PLAIN: attach a 1/0 mask over vocab so loss applies ONLY to move tokens (m_*)
         try:
             is_move_vec = torch.zeros(vocab_size, dtype=torch.float32)
@@ -1904,7 +2134,7 @@ def _train_backgammon_model_core(text, checkpoint_data=None):
         model = checkpoint_model
         # Update vocab_size to reflect merged vocabulary (may have grown)
         vocab_size = len(move_to_idx)
-        model.start_game_token = move_to_idx['<STARTGAME>']
+        model.set_special_ids(move_to_idx)
         print(f"Resuming from checkpoint: epoch {start_epoch}, batch {start_batch}")
 
         # Display model architecture (cannot be changed)
@@ -2008,8 +2238,8 @@ def _train_backgammon_model_core(text, checkpoint_data=None):
         num_epochs = int(get_input_with_default("Number of epochs", num_epochs))
 
         # Create your own BackgammonModel for backgammon move prediction
-        model = BackgammonModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=True)
-        model.start_game_token = move_to_idx['<STARTGAME>']
+        model = BackgammonModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=True, use_value_head=True)
+        model.set_special_ids(move_to_idx)
       # PLAIN: attach move-only loss mask for fresh training too
         try:
             is_move_vec = torch.zeros(vocab_size, dtype=torch.float32)
@@ -2101,8 +2331,8 @@ def _train_backgammon_model_core(text, checkpoint_data=None):
 
                         for i, gpu_idx in enumerate(gpu_indices):
                             # Create model on specific GPU
-                            model_gpu = BackgammonModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=True)
-                            model_gpu.start_game_token = move_to_idx['<STARTGAME>']
+                            model_gpu = BackgammonModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=True, use_value_head=True)
+                            model_gpu.set_special_ids(move_to_idx)
 
                             # If loading from checkpoint, copy the loaded weights to each GPU model
                             if checkpoint_data:
@@ -2178,19 +2408,22 @@ def _train_backgammon_model_core(text, checkpoint_data=None):
                 scaler_state_dict = checkpoint_data[10]    # scaler states (list for multi-GPU)
 
                 if isinstance(optimizer_state_dict, list) and len(optimizer_state_dict) == len(optimizers):
-                    print(f"Loading {len(optimizer_state_dict)} optimizer states for {len(optimizers)} GPUs")
-                    # When vocabulary expands, we must filter out old optimizer state for changed parameters
-                    if vocab_expanded:
-                        print(f"🔧 Filtering optimizer state for vocabulary expansion ({vocab_old_size}→{vocab_new_size} tokens)...")
-                        optimizer_state_dict = filter_optimizer_state(optimizer_state_dict, models[0])
-                    for i, opt_state in enumerate(optimizer_state_dict):
-                        optimizers[i].load_state_dict(opt_state)
-                        print(f"  GPU {gpu_indices[i]}: optimizer state loaded")
+                    if not optimizer_state_matches(optimizers[0], optimizer_state_dict):
+                        pass
+                    else:
+                        print(f"Loading {len(optimizer_state_dict)} optimizer states for {len(optimizers)} GPUs")
+                        # When vocabulary expands, we must filter out old optimizer state for changed parameters
+                        if vocab_expanded:
+                            print(f"🔧 Filtering optimizer state for vocabulary expansion ({vocab_old_size}→{vocab_new_size} tokens)...")
+                            optimizer_state_dict = filter_optimizer_state(optimizer_state_dict, models[0])
+                        for i, opt_state in enumerate(optimizer_state_dict):
+                            optimizers[i].load_state_dict(opt_state)
+                            print(f"  GPU {gpu_indices[i]}: optimizer state loaded")
 
-                        # Always reset LR when switching to cosine scheduler (multi-GPU)
-                        if scheduler_choice == 'cosine':
-                            optimizers[i].param_groups[0]['lr'] = learning_rate
-                            print(f"  GPU {gpu_indices[i]}: reset LR to {learning_rate} for cosine scheduler")
+                            # Always reset LR when switching to cosine scheduler (multi-GPU)
+                            if scheduler_choice == 'cosine':
+                                optimizers[i].param_groups[0]['lr'] = learning_rate
+                                print(f"  GPU {gpu_indices[i]}: reset LR to {learning_rate} for cosine scheduler")
 
                 # Always start with fresh scheduler states when loading checkpoint
                 print(f"🔄 Using fresh {scheduler_choice} schedulers for all GPUs (allows switching types for stuck runs)")
@@ -2209,7 +2442,24 @@ def _train_backgammon_model_core(text, checkpoint_data=None):
                 # Model already moved to device above
                 use_custom_parallel = False
 
-                print("ℹ️  torch.compile() disabled for stability - using standard model")
+                # Same as Chess on this Spark: compile the model so the GPU runs fused kernels.
+                # mode='default' on purpose. reduce-overhead keeps CUDA graphs that can freeze a GB10.
+                if not os.environ.get('BACKGAMMON_NO_COMPILE') and hasattr(torch, 'compile'):
+                    try:
+                        print("Enabling torch.compile()...")
+                        _eager_model = model
+                        model = torch.compile(model, mode='default')
+                        with torch.no_grad():
+                            _warm_t = min(int(getattr(_eager_model, 'block_size', 128)), 256)
+                            _warm = torch.full((2, _warm_t), move_to_idx['<STARTGAME>'], dtype=torch.long, device=device)
+                            model(_warm)
+                        print("torch.compile() enabled")
+                    except Exception as e:
+                        print(f"torch.compile() failed: {str(e).strip().splitlines()[-1][:200]}")
+                        print("Continuing without torch.compile (set BACKGAMMON_NO_COMPILE=1 to skip the attempt)")
+                        model = _eager_model
+                else:
+                    print("torch.compile() skipped")
         else:
             print("❌ ERROR: No CUDA GPUs available. This backgammon training requires GPU support.")
             print("   Please run on a system with GPU support (CUDA or MPS).")
@@ -2263,28 +2513,31 @@ def _train_backgammon_model_core(text, checkpoint_data=None):
 
         # Restore optimizer and scheduler state if resuming from checkpoint
         if checkpoint_data and optimizer_state_dict:
-            print("Loading optimizer state from checkpoint")
-            # When vocabulary expands, we must filter out old optimizer state for changed parameters
-            if vocab_expanded:
-                print(f"🔧 Filtering optimizer state for vocabulary expansion ({vocab_old_size}→{vocab_new_size} tokens)...")
-                optimizer_state_dict = filter_optimizer_state(optimizer_state_dict, model)
-            # Handle case where checkpoint has multi-GPU states but we're loading in single GPU mode
-            if isinstance(optimizer_state_dict, list):
-                print("⚠️  Checkpoint has multi-GPU optimizer states, using first one for single GPU resume")
-                optimizer.load_state_dict(optimizer_state_dict[0])
+            if not optimizer_state_matches(optimizer, optimizer_state_dict):
+                pass
             else:
-                optimizer.load_state_dict(optimizer_state_dict)
+                print("Loading optimizer state from checkpoint")
+                # When vocabulary expands, we must filter out old optimizer state for changed parameters
+                if vocab_expanded:
+                    print(f"🔧 Filtering optimizer state for vocabulary expansion ({vocab_old_size}→{vocab_new_size} tokens)...")
+                    optimizer_state_dict = filter_optimizer_state(optimizer_state_dict, model)
+                # Handle case where checkpoint has multi-GPU states but we're loading in single GPU mode
+                if isinstance(optimizer_state_dict, list):
+                    print("⚠️  Checkpoint has multi-GPU optimizer states, using first one for single GPU resume")
+                    optimizer.load_state_dict(optimizer_state_dict[0])
+                else:
+                    optimizer.load_state_dict(optimizer_state_dict)
 
-            # Always reset LR when switching to cosine scheduler (it should start fresh, not inherit plateau's crushed LR)
-            if scheduler_choice == 'cosine':
-                print(f"Switching to cosine scheduler - resetting LR to {learning_rate} (ignoring checkpoint LR)")
-                optimizer.param_groups[0]['lr'] = learning_rate
-                print(f"Cosine scheduler starting with fresh learning rate: {learning_rate}")
-            else:
-                # For plateau scheduler, keep the checkpoint LR (it manages its own decay)
-                current_lr = optimizer.param_groups[0]['lr']
-                learning_rate = current_lr  # Update our variable to match
-                print(f"Resumed with learning rate: {learning_rate}")
+                # Always reset LR when switching to cosine scheduler (it should start fresh, not inherit plateau's crushed LR)
+                if scheduler_choice == 'cosine':
+                    print(f"Switching to cosine scheduler - resetting LR to {learning_rate} (ignoring checkpoint LR)")
+                    optimizer.param_groups[0]['lr'] = learning_rate
+                    print(f"Cosine scheduler starting with fresh learning rate: {learning_rate}")
+                else:
+                    # For plateau scheduler, keep the checkpoint LR (it manages its own decay)
+                    current_lr = optimizer.param_groups[0]['lr']
+                    learning_rate = current_lr  # Update our variable to match
+                    print(f"Resumed with learning rate: {learning_rate}")
 
         # Always start with fresh scheduler state when loading checkpoint
         print(f"🔄 Using fresh {scheduler_choice} scheduler (allows switching types for stuck runs)")
@@ -2315,12 +2568,16 @@ def _train_backgammon_model_core(text, checkpoint_data=None):
         persistent_workers = False  # Disable for stability
         prefetch_factor = None  # Disable prefetch
     else:
-        # Single GPU setup - optimal configuration for backgammon training
-        print("Single GPU: Using optimal configuration for backgammon training (num_workers=0)")
-        num_workers = 0  # No workers - optimal for single GPU backgammon training
-        pin_memory = device.type == 'cuda'  # Pin memory only for CUDA
-        persistent_workers = False
-        prefetch_factor = None
+        # Same loader settings as Chess. On the Spark, pin_memory copies the same RAM twice, so it stays off.
+        if _uses_unified_memory():
+            num_workers = min(2, os.cpu_count() or 1)
+            pin_memory = False
+        else:
+            num_workers = min(8, (os.cpu_count() or 2) // 2)
+            pin_memory = device.type == 'cuda'
+        persistent_workers = num_workers > 0
+        prefetch_factor = 2 if num_workers > 0 else None
+        print(f"Single GPU data loader: {num_workers} workers, pin_memory={pin_memory}")
 
     # Print the number of model parameters
     num_params = sum(p.numel() for p in get_model_module(model).parameters())
@@ -2368,7 +2625,7 @@ def _train_backgammon_model_core(text, checkpoint_data=None):
 
             print(f"DataLoader length: {len(data_loader)}, Epoch: {epoch+1}/{num_epochs}")
 
-            for batch_idx, (x, y) in enumerate(data_loader):
+            for batch_idx, (x, y, token_weights) in enumerate(data_loader):
                 if epoch == start_epoch and batch_idx < start_batch:
                     continue
 
@@ -2377,20 +2634,22 @@ def _train_backgammon_model_core(text, checkpoint_data=None):
                 batch_size_per_gpu = x.shape[0] // num_gpus
                 x_splits = torch.split(x, batch_size_per_gpu)
                 y_splits = torch.split(y, batch_size_per_gpu)
+                w_splits = torch.split(token_weights, batch_size_per_gpu)
 
                 # Accumulators for correct loss averaging
                 batch_weighted_loss_sum = 0.0
                 batch_total_tokens = 0
 
                 # Forward and backward pass on each GPU independently
-                for gpu_idx, (model_gpu, opt_gpu, scal_gpu, x_gpu, y_gpu) in enumerate(zip(models, optimizers, scalers, x_splits, y_splits)):
+                for gpu_idx, (model_gpu, opt_gpu, scal_gpu, x_gpu, y_gpu, w_gpu) in enumerate(zip(models, optimizers, scalers, x_splits, y_splits, w_splits)):
                     x_gpu = x_gpu.to(f'cuda:{gpu_idx}', non_blocking=True)
                     y_gpu = y_gpu.to(f'cuda:{gpu_idx}', non_blocking=True)
+                    w_gpu = w_gpu.to(f'cuda:{gpu_idx}', non_blocking=True)
 
                     # Forward pass with mixed precision
                     with autocast(device_type='cuda', dtype=torch.float16, enabled=True):
                         # Unpack (loss, num_tokens) tuple
-                        output, (loss, num_tokens) = model_gpu(x_gpu, targets=y_gpu)
+                        output, (loss, num_tokens) = model_gpu(x_gpu, targets=y_gpu, token_weights=w_gpu)
 
                     # Backward pass
                     opt_gpu.zero_grad(set_to_none=True)
@@ -2532,11 +2791,13 @@ def _train_backgammon_model_core(text, checkpoint_data=None):
 
             print(f"DataLoader length: {len(data_loader)}, Epoch: {epoch+1}/{num_epochs}")
 
-            for batch_idx, (x, y) in enumerate(data_loader):
+            for batch_idx, (x, y, token_weights) in enumerate(data_loader):
                 if epoch == start_epoch and batch_idx < start_batch:
                     continue
 
-                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+                token_weights = token_weights.to(device, non_blocking=True)
 
                 if batch_idx == 0:
                     print(f"Batch shapes: x={x.shape}, y={y.shape}")
@@ -2545,7 +2806,7 @@ def _train_backgammon_model_core(text, checkpoint_data=None):
                 if device.type == 'cuda':
                     with autocast(device_type='cuda', dtype=torch.float16, enabled=True):
                         # Unpack (loss, num_tokens) tuple
-                        output, (loss, num_tokens) = model(x, targets=y)
+                        output, (loss, num_tokens) = model(x, targets=y, token_weights=token_weights)
 
                     optimizer.zero_grad(set_to_none=True)
                     scaler.scale(loss).backward()
@@ -2558,7 +2819,7 @@ def _train_backgammon_model_core(text, checkpoint_data=None):
                     scaler.update()
                 else:
                     # Unpack (loss, num_tokens) tuple
-                    output, (loss, num_tokens) = model(x, targets=y)
+                    output, (loss, num_tokens) = model(x, targets=y, token_weights=token_weights)
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     optimizer.step()
@@ -2574,7 +2835,7 @@ def _train_backgammon_model_core(text, checkpoint_data=None):
                 current_batch_x = x
 
                 # Explicit cleanup
-                del output, loss, x, y
+                del output, loss, x, y, token_weights
                 if device.type == 'cuda':
                     torch.cuda.empty_cache()
 

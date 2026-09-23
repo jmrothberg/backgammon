@@ -142,11 +142,12 @@ class BackgammonBlock(nn.Module):
 
 # BackgammonModel
 class BackgammonModel(nn.Module):
-    def __init__(self, vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=False, use_dna=False):
+    def __init__(self, vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=False, use_dna=False, use_value_head=False):
         super().__init__()
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.use_chess = use_chess
+        self.use_value_head = use_value_head
 
         if use_chess:
             self.start_game_token = None
@@ -161,6 +162,9 @@ class BackgammonModel(nn.Module):
 
         self.rms_final = RMSNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
+        # Same head as the trainer: 0 = White won, 1 = Black won. Absent on older checkpoints.
+        if self.use_value_head:
+            self.head_value = nn.Linear(n_embd, 2)
 
         self.apply(self._init_weights)
 
@@ -179,6 +183,24 @@ class BackgammonModel(nn.Module):
         game_boundaries = (idx == self.start_game_token).float().cumsum(dim=1)
         mask = (game_boundaries.unsqueeze(1) == game_boundaries.unsqueeze(2)).float()
         return mask
+
+    def _hidden(self, idx):
+        """Hidden states at every position. Used by the win-guesser."""
+        B, T = idx.shape
+        tok_emb = self.token_embedding_table(idx)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device))
+        x = tok_emb + pos_emb
+        for block in self.blocks:
+            x = block(x, mask=self.create_game_mask(idx))
+        return self.rms_final(x)
+
+    @torch.no_grad()
+    def predict_value(self, idx):
+        """Softmax over (White won, Black won) at the last position."""
+        if not self.use_value_head:
+            return None
+        h = self._hidden(idx)
+        return F.softmax(self.head_value(h[:, -1]), dim=-1)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -616,10 +638,6 @@ class BackgammonMovePredictor:
             self.idx_to_move = {idx: move for move, idx in self.move_to_idx.items()}
             print(f"Loaded tokenizer with {len(self.move_to_idx)} tokens")
 
-        # Create model
-        self.model = BackgammonModel(vocab_size, n_embd, n_head, n_kv_heads,
-                                   block_size, n_layer, dropout, use_chess=True)
-
         # Load state dict with device compatibility
         state_dict = checkpoint['model_state_dict']
 
@@ -640,8 +658,24 @@ class BackgammonMovePredictor:
 
             cleaned_state_dict[new_key] = val
 
+        # Older checkpoints have no win head. Do not invent one — play then keeps the first legal turn.
+        has_value_head = any(
+            key == 'head_value.weight' or key.endswith('head_value.weight')
+            for key in cleaned_state_dict
+        )
+
+        # Create model
+        self.model = BackgammonModel(vocab_size, n_embd, n_head, n_kv_heads,
+                                   block_size, n_layer, dropout, use_chess=True,
+                                   use_value_head=has_value_head)
+
         # Load with strict=False to handle missing keys
         self.model.load_state_dict(cleaned_state_dict, strict=False)
+        self.model._has_value_head = bool(has_value_head and self.model.use_value_head)
+        if self.model._has_value_head:
+            print("Win-guesser loaded (value head). A later legal turn can replace the 1st pick.")
+        else:
+            print("No win-guesser on this checkpoint. The first legal turn is played.")
 
         # Set start token
         self.model.start_game_token = self.move_to_idx.get('<STARTGAME>', 0)
@@ -668,6 +702,61 @@ class BackgammonMovePredictor:
 
         print(f"✅ Model loaded successfully on {self.device}")
         print(f"   Model has {sum(p.numel() for p in self.model.parameters()):,} parameters")
+
+    def with_result_token(self, game_history, result_token):
+        """Put <W>, <B>, or <U> immediately after <STARTGAME>.
+
+        Older checkpoints have none of those tokens, so the history is returned unchanged
+        and play stays exactly as it was.
+        """
+        if not self.move_to_idx or '<U>' not in self.move_to_idx or '<W>' not in self.move_to_idx:
+            return list(game_history)
+        hist = list(game_history)
+        if not hist:
+            return ['<STARTGAME>', result_token]
+        if hist[0] != '<STARTGAME>':
+            return hist
+        if len(hist) > 1 and hist[1] in ('<W>', '<B>', '<U>'):
+            hist[1] = result_token
+        else:
+            hist.insert(1, result_token)
+        return hist
+
+    @torch.no_grad()
+    def rerank_by_value(self, game_history, dice, side, sequences):
+        """Score each full turn with the win head.
+
+        Prompt is <STARTGAME> <U> history dice moves, so the head cannot read a result token.
+        Score is P(our color wins) - P(our color loses). side is 'W' or 'B'.
+        sequences is a list of (probability, token list).
+        Returns {tuple(tokens): score}. Empty when this checkpoint has no value head.
+        """
+        if not getattr(self.model, '_has_value_head', False) or not sequences:
+            return {}
+        if '<U>' not in self.move_to_idx:
+            return {}
+        base = self.with_result_token(game_history, '<U>')
+        clean_dice = dice[1:] if isinstance(dice, str) and dice.startswith('d') and len(dice) > 2 else dice
+        prefix = base + split_dice(clean_dice)
+        block = self.model.block_size
+        scores = {}
+        for _prob, seq in sequences:
+            moves = [tok for tok in seq if tok and tok != '<EOM>']
+            ids = [self.move_to_idx[tok] for tok in (prefix + moves) if tok in self.move_to_idx]
+            if not ids:
+                continue
+            # Keep <STARTGAME> <U> and the newest tokens when the game is longer than the block.
+            if len(ids) > block:
+                ids = ids[:2] + ids[-(block - 2):]
+            idx = torch.tensor([ids], dtype=torch.long, device=self.device)
+            probs = self.model.predict_value(idx)
+            if probs is None:
+                return {}
+            white_win = probs[0, 0].item()
+            black_win = probs[0, 1].item()
+            score = (white_win - black_win) if side == 'W' else (black_win - white_win)
+            scores[tuple(seq)] = score
+        return scores
 
     def predict_moves(self, game_history, dice, top_k=5):
         """
