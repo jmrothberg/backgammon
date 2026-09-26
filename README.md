@@ -1,6 +1,6 @@
 # Backgammon
 
-A transformer learns backgammon by reading move sequences. Training does not use search. The Pygame window plays a human against that model, and falls back to search (minimax with alpha-beta) when every neural suggestion is illegal.
+A transformer learns backgammon by reading move sequences. Training does not use search. The Pygame window plays a human against that model, and falls back to search when every neural suggestion is illegal.
 
 ## Train
 
@@ -64,11 +64,12 @@ python Backgammon_9_22_26.py
 
 You are the blue pieces (White in the model). The AI is pink (Black). `Backgammon_Inference.py` must sit next to the game, and you pick a `.pth` when the window starts.
 
+- **h**: show or hide help. It is drawn in the left column, where your moves are listed, and it is on when the game starts.
 - **Space**: opening roll, and every later roll on your turn. A tie on the opening roll needs Space again.
-- **Click a point**: select one of your checkers, then click the destination. Click the same point to deselect.
-- **Bar**: click the vertical line in the center, not the checker. Your bar checkers are drawn to the left of that line, outside the click strip.
-- **Bear off**: click that same center line once you have nothing on the bar.
-- **v**: AI vs AI
+- **Click a point**: select one of your checkers, then click the destination. Click the same point to deselect. The selected checker is drawn larger.
+- **Bar**: click the checker itself (left of the center line). If you have a checker on the bar it is selected for you when you roll, and the next click is the entry point.
+- **Bear off**: click the center line once you have nothing on the bar.
+- **v**: self-play. Blue is the model and Red is the search agent, so you can watch the model against search. With no model loaded, both sides are search.
 - **r** / **q**: restart / quit after a game
 
 If the model's first choice is illegal, the terminal prints `LLM 1st choice was not legal` immediately. A later legal turn can replace that pick when the win-guess is better. At the end, the window shows how often the first choice was legal and how often the win-guesser overrode it. Search runs only when no suggestion is legal.
@@ -102,6 +103,6 @@ Loss is read from the checkpoint filename (`_L0.835_`). The argument is the fold
 
 **First choice is often illegal:** the checkpoint is not matching the board. The end-of-game counts show that.
 
-**Bar click does nothing:** click the center line. Clicking the checker itself hits a board point.
+**Bar click does nothing:** click the blue checker to the left of the center line. After you roll, that checker is already selected.
 
 **Training looks stuck after the first batch:** loss prints every 100 batches, and the first `torch.compile` step is slow. Out of memory: lower the batch size when the trainer asks.

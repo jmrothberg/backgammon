@@ -422,122 +422,57 @@ def perform_search_ai_with_move_capture(dice, moves_left_ai, player):
     Returns:
         (start_pos, end_pos) tuple for the move made, or None if no move
     """
-    global black_pieces_off, white_pieces_off
     # === SEARCH AI ALGORITHM ===
     # We'll modify the ai_move logic to capture and return the move
     # For simplicity, let's implement a basic version that finds the best move
     # and returns it before executing
 
+    print(f"🎯 Search AI evaluating the whole turn with dice: {dice} (playing as {'black' if player == -1 else 'white'})")
+
+    # Search every legal way to use the remaining dice, on copies of the board.
+    # The old search scored one checker and stopped, so it could waste the first die.
+    # Two-die turns are fully expanded. Doubles keep the best 8 lines after each checker.
     best_move = None
-    min_score = float('inf')  # Always look for minimum score (after inversion for white)
+    min_score = float('inf')
 
-    print(f"🎯 Search AI evaluating moves with dice: {dice} (playing as {'black' if player == -1 else 'white'})")
+    def _remaining(dice_list):
+        return [d for d in dice_list if 0 < d < 7]
 
-    # === CHECK FOR MANDATORY BAR MOVES ===
-    bar_index = 1 if player == -1 else 0
-    bar_start = -1 if player == -1 else 25  # FIX: black uses -1, white uses 25 for bar (consistent with letter_to_idx)
-    must_move_from_bar = False
-    if bar[bar_index] > 0:
-        for end in range(1, BOARD_SIZE + 2):  # Check positions 1-25
-            if is_valid_move(bar_start, end, dice, player):
-                must_move_from_bar = True
-                break
+    def _search_rest(b, ba, dice_left, first):
+        nonlocal best_move, min_score
+        pairs = []
+        for tok in legal_move_tokens(player, dice_left, b, ba):
+            start, end = token_to_positions(tok, dice_left, player)
+            if start is None or end is None:
+                continue
+            pairs.append((start, end))
+        if not pairs:
+            score = evaluate_board(b, ba, player)
+            if score < min_score:
+                min_score = score
+                best_move = first
+            return
+        children = []
+        for start, end in pairs:
+            nb = b[:]
+            nba = ba[:]
+            nd = dice_left[:]
+            # Same piece and bar change as make_move. The live board is not touched.
+            apply_checker(nb, nba, start, end, player)
+            if not consume_die(nd, start, end, player, nb):
+                continue
+            children.append((nb, nba, nd, first or (start, end)))
+        if len(_remaining(dice_left)) > 2 and len(children) > 8:
+            children.sort(key=lambda child: evaluate_board(child[0], child[1], player))
+            children = children[:8]
+        for nb, nba, nd, first_move in children:
+            _search_rest(nb, nba, nd, first_move)
 
-    # === MOVE EVALUATION LOOP ===
-    # Find the best move by evaluating all possible moves
-    starts = [bar_start] + list(range(1, BOARD_SIZE + 1))
-    for start in starts:
-        # Skip invalid starting positions
-        if start == bar_start and bar[bar_index] == 0:  # No pieces on bar for this player
-            continue
-        if start != bar_start and (board[start] * player) <= 0:  # Not a piece of the correct color
-            continue
-        # If must move from bar, skip non-bar moves
-        if must_move_from_bar and start != bar_start:
-            continue
-
-        for end in range(0, BOARD_SIZE + 2):  # Include positions 0-25 (bearing off: white=0, black=25)
-            if is_valid_move(start, end, dice, player):
-                # === BOARD STATE BACKUP (CRITICAL) ===
-                # Save current board state before trying the move
-                # DEBUG: This was the bug - was trying [row[:] for row in board] on 1D list
-                original_board = board[:]  # Correct: simple list copy
-                original_bar = bar[:]
-                original_black_pieces_off = black_pieces_off
-                original_white_pieces_off = white_pieces_off
-                original_dice = dice[:]  # Backup dice state
-
-                # === TEMPORARY MOVE EXECUTION ===
-                # Make the move temporarily to evaluate the resulting position
-                # This simulates what the board would look like after the move
-                bar_index = 1 if player == -1 else 0  # Bar index for this player
-                opponent_bar_index = 0 if player == -1 else 1  # Opponent's bar
-
-                if start == bar_start:  # Moving from bar
-                    bar[bar_index] -= 1
-                else:  # Moving from board position
-                    board[start] -= player  # Remove piece from start (player pieces are +player or -player)
-
-                if end == 25 or end == 0:  # Bearing off (white=0, black=25)
-                    if player == -1:
-                        black_pieces_off += 1
-                    else:
-                        white_pieces_off += 1
-                elif board[end] == -player:  # Hitting opponent piece
-                    board[end] = player  # Place our piece
-                    bar[opponent_bar_index] += 1  # Send opponent piece to bar
-                else:  # Regular move
-                    board[end] += player  # Place our piece
-
-                # === TEMPORARY DICE UPDATE ===
-                # Update dice state for evaluation of remaining moves
-                if end == 25 or end == 0:  # Bearing off
-                    distance = 25 - start if player == -1 else start
-                    # Find which die was used
-                    for i in range(len(dice)):
-                        if dice[i] == distance or (dice[i] > distance and dice[i] < 7):
-                            dice[i] = 7  # Mark as used
-                            break
-                else:
-                    # Handle bar moves correctly for dice update
-                    if start == 25:  # White bar
-                        move_distance = 25 - end
-                    elif start == -1:  # Black bar
-                        move_distance = end
-                    else:
-                        move_distance = abs(end - start)
-                        
-                    for i in range(len(dice)):
-                        if dice[i] == move_distance and dice[i] < 7:
-                            dice[i] = 7  # Mark as used
-                            break
-
-                # === POSITION EVALUATION ===
-                # Evaluate how good this board position is for the AI player
-                score = evaluate_board(board, bar, player)
-
-                # Bonus for bearing off from furthest positions
-                if end == 0 or end == 25:  # Bearing off move
-                    if player == 1 and end == 0:  # White bearing off from lower positions (furthest from off)
-                        score -= (7 - start) * 1000  # Lower start gets much better (lower) score
-                    elif player == -1 and end == 25:  # Black bearing off from lower positions (furthest from off)
-                        score -= (25 - start) * 1000  # Lower start gets much better (lower) score
-
-                # === BOARD STATE RESTORATION ===
-                # Restore the board to its original state for next evaluation
-                board[:] = original_board
-                bar[:] = original_bar
-                black_pieces_off = original_black_pieces_off
-                white_pieces_off = original_white_pieces_off
-                dice[:] = original_dice  # Restore dice state
-
-                # === BEST MOVE TRACKING ===
-                # Always look for minimum score (after inversion for white)
-                if score < min_score:
-                    min_score = score
-                    best_move = (start, end)
+    _search_rest(board[:], bar[:], list(dice), None)
 
     # === EXECUTE BEST MOVE ===
+    # Only the first checker of the best full turn is played. The caller asks again
+    # for the next checker, so the rest of the turn is searched with the new board.
     if best_move:
         move_token = move_to_token(best_move[0], best_move[1], player)
         print(f"🤖 {move_token}")
@@ -939,21 +874,21 @@ def evaluate_board(board, bar, player=1):
     
     # Advanced backgammon strategies
     if player == -1:  # Black perspective (home: 19-24)
-        # Holding game
-        if board[1] >= 2 and board[2] >= 2:
+        # Holding game: black anchors in white's home (points 1 and 2). >= 2 there is white's stack.
+        if board[1] <= -2 and board[2] <= -2:
             score -= 200
 
         # Priming game
         if black_primes >= 2:
             score -= 150
 
-        # Blitz
-        black_builders = sum(1 for i in range(1, 7) if board[i] >= 2)
+        # Blitz: black builders in white's home are negative counts.
+        black_builders = sum(1 for i in range(1, 7) if board[i] <= -2)
         if black_builders >= 2:
             score -= 130
 
-        # Backgame
-        black_back_checkers = sum(abs(board[i]) for i in range(13, 19))
+        # Backgame: black checkers in the outfield. abs() was counting white checkers too.
+        black_back_checkers = sum(-board[i] for i in range(13, 19) if board[i] < 0)
         if black_back_checkers >= 3:
             score -= 80
 
@@ -966,8 +901,8 @@ def evaluate_board(board, bar, player=1):
         timing = sum(1 for i in range(7, 19) if board[i] == -1)
         score -= timing * 50
 
-        # Duplication
-        duplication = sum(1 for i in range(7, 19) if board[i] >= 2)
+        # Duplication: black stacks. board[i] >= 2 is a white stack.
+        duplication = sum(1 for i in range(7, 19) if board[i] <= -2)
         score -= duplication * 40
 
         # Diversification
@@ -1105,15 +1040,36 @@ def count_primes(board, player):
             consecutive = 0
     return primes
 
+def _click_on_white_bar(x, y):
+    """True when the click is on a blue checker sitting on the bar, or in the gap next to it.
+
+    Those checkers are drawn to the left of the center line. The old hit box was only
+    the line itself, so clicking the checker selected a board point instead.
+    """
+    if bar[0] <= 0:
+        return False
+    bar_center_x = WIDTH // 2
+    bar_y = HEIGHT // 2
+    for i in range(bar[0]):
+        x_pos = bar_center_x - PIECE_SIZE - (i * PIECE_SIZE)
+        if (x - x_pos) ** 2 + (y - bar_y) ** 2 <= (PIECE_SIZE // 2 + 10) ** 2:
+            return True
+    left = bar_center_x - PIECE_SIZE * (bar[0] + 1)
+    return left <= x <= bar_center_x + 24 and abs(y - bar_y) <= PIECE_SIZE
+
+
 def get_clicked_position(pos):
     x, y = pos
+    # The checker on the bar is a legal click, not only the thin center line.
+    if _click_on_white_bar(x, y):
+        return 25  # White bar
     #Want to click at center to move off board (or bar)
     # Much smaller detection area around the bar line to avoid interfering with board positions
     bar_detection_width = 20  # Small area around the bar line
     if x > WIDTH // 2 - bar_detection_width and x < WIDTH // 2 + bar_detection_width :
         if bar[0] > 0:
             return 25  # White bar
-        return 0  # Black bar
+        return 0  # Bear off (white). The center line is the bear-off click once the bar is empty.
     if y < HEIGHT // 2:
         # Top row: 13-24 (left to right)
         return 13 + x // (WIDTH // 12)
@@ -1507,18 +1463,51 @@ def is_game_over():
 
 
 # Function to display the current player's turn
+def side_uses_llm(turn):
+    """True when this side should ask the model.
+
+    In self-play (v), Blue is the model and Red is the search agent, so the model
+    can be watched against search. With no model loaded, both sides use search.
+    """
+    if ai_type != "LLM_AI" or not llm_predictor:
+        return False
+    if versus_mode and turn == -1:
+        return False
+    return True
+
+
+def draw_help():
+    """Write the controls in the left column, where this player's moves are listed."""
+    help_font = pygame.font.Font(None, 22)
+    lines = [
+        "h  hide or show this help",
+        "v  self-play: Blue model vs Red search",
+        "Click your checker, then where it goes",
+        "Bar: click the checker left of center",
+        "Bear off: click the center line    r restart  q quit",
+    ]
+    for i, line in enumerate(lines):
+        y = HEIGHT + 50 + i * 20
+        pygame.draw.rect(screen, WHITE_ISH, pygame.Rect(8, y, 430, 20))
+        screen.blit(help_font.render(line, True, BLACK), (10, y))
+
+
 def display_turn(player_turn):
     font = pygame.font.Font(None, 32)
     if player_turn == 1:
-        if versus_mode:
-            text = font.render("Blue AI rolling...", True, BLACK)
+        if versus_mode and side_uses_llm(1):
+            text = font.render("Blue model vs Red search", True, BLACK)
+        elif versus_mode:
+            text = font.render("Blue search rolling...", True, BLACK)
         else:
             text = font.render("Blue's Turn roll Die", True, BLACK)
         x = 10
     else:
         ai_name = ai_type.replace("_", " ").upper()
-        if versus_mode:
-            text = font.render(f"Red {ai_name} Thinking..", True, BLACK)
+        if versus_mode and llm_predictor and ai_type == "LLM_AI":
+            text = font.render("Red search thinking..", True, BLACK)
+        elif versus_mode:
+            text = font.render("Red search thinking..", True, BLACK)
         else:
             text = font.render(f"Red {ai_name} Thinking..", True, BLACK)
         x = 410
@@ -1624,7 +1613,8 @@ else:
 # === MAIN GAME LOOP INITIALIZATION ===
 running = True
 game_over = False
-versus_mode = False  # When True, AI plays both sides
+versus_mode = False  # When True, Blue is the model and Red is the search agent
+help_visible = True  # Controls sit in the left move list until h hides them
 
 # === CRITICAL GAME STATE VARIABLES ===
 player_turn = 1  # 1 = white (human player), -1 = black (AI)
@@ -1813,8 +1803,15 @@ while running:
                 print(f"Clicked position: {clicked_position}")
                 
                 if selected_piece is None:
-                    if clicked_position == 25 and bar[0] > 0:  # White bar
+                    # On the bar you must enter before touching any other checker.
+                    # Clicking the bar checker, or any point while the bar is occupied, selects it.
+                    if bar[0] > 0:
                         selected_piece = 25
+                        print("Selected the checker on the bar")
+                        text = font.render("Bar selected. Click the point where it enters.", True, BLACK)
+                        rect = pygame.Rect(0, HEIGHT+150, WIDTH, 50)
+                        pygame.draw.rect(screen, WHITE_ISH, rect)
+                        screen.blit(text, (10, HEIGHT + 150))
                     elif clicked_position <= BOARD_SIZE and board[clicked_position] > 0:
                         selected_piece = clicked_position
                         print(f"Selected piece: {selected_piece}")
@@ -1905,11 +1902,19 @@ while running:
                             screen.blit(text, (10, HEIGHT + 150))
 
         elif event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_v:
-                # Toggle versus mode
+            if event.key == pygame.K_h:
+                # Help uses the same left column as the move list.
+                help_visible = not help_visible
+                if not help_visible:
+                    for i in range(5):
+                        pygame.draw.rect(screen, WHITE_ISH, pygame.Rect(8, HEIGHT + 50 + i * 20, 430, 20))
+            elif event.key == pygame.K_v:
+                # Self-play: Blue (the model) against Red (the search agent).
                 versus_mode = not versus_mode
-                if versus_mode:
-                    print("🤖🤖 VERSUS MODE: AI vs AI enabled!")
+                if versus_mode and side_uses_llm(1):
+                    print("Self-play: Blue model vs Red search")
+                elif versus_mode:
+                    print("Self-play: search vs search (no model loaded)")
                 else:
                     print("👤🤖 HUMAN MODE: Human vs AI enabled!")
             elif event.key == pygame.K_SPACE and player_turn == 1 and not dice_rolled:
@@ -1933,6 +1938,10 @@ while running:
                 pygame.draw.rect(screen, WHITE_ISH, rect)
                 draw_dice(dice1, dice2)
                 dice_rolled = True
+                # A checker on the bar is already selected, so the next click is the entry point.
+                if bar[0] > 0:
+                    selected_piece = 25
+                    print("Selected the checker on the bar")
                 moves_left = 2
                 if dice1 == dice2:
                     moves_left *= 2
@@ -1974,7 +1983,7 @@ while running:
         dice1, dice2 = roll_dice()
         #dice1, dice2 = 4,4 # test
         draw_dice(dice1, dice2)
-        print ("Red AI rolled:",dice1, dice2)
+        print(("Blue" if player_turn == 1 else "Red") + " rolled:", dice1, dice2)
 
         # Store dice token for later addition to history (after turn completion)
         # Use canonical order: larger die first (matches LLM training data)
@@ -2010,7 +2019,7 @@ while running:
         
         # === LLM AI PRIMARY PATH ===
         # LLM is called ONCE per turn with fresh dice and predicts entire turn
-        if ai_type == "LLM_AI":
+        if side_uses_llm(player_turn):
             # Call LLM once at start of turn with fresh dice
             llm_result = llm_ai_move([dice1, dice2, dice3, dice4], moves_left_ai, game_history_tokens, player_turn)
             
@@ -2120,8 +2129,11 @@ while running:
             display_winner(winner)
             game_over = True
 
-    draw_board(board, bar)
+    draw_board(board, bar, [selected_piece] if selected_piece is not None else None)
     draw_dice(dice1, dice2)
+    # Help sits on top of the move list. h clears it so the moves can be read.
+    if help_visible and not game_over:
+        draw_help()
     pygame.display.flip()
 
     # Handle game over state
